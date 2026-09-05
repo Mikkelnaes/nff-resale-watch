@@ -2,11 +2,19 @@ name: watch-resale
 
 on:
   schedule:
-    - cron: '0,5,10,15,20,25,30,35,40,45,50,55 * * * *'   # every 5 minutes (GitHub's minimum; may lag)
-  workflow_dispatch:         # manual "Run workflow" button for testing
+    - cron: '0,5,10,15,20,25,30,35,40,45,50,55 * * * *'   # every 5 minutes; GitHub runs this only sporadically, cron-job.org is the real trigger
+  workflow_dispatch:         # started every 5 minutes by cron-job.org; the inputs are for end-to-end tests
     inputs:
-      url:
-        description: 'Page URL to check (leave empty for the real resale page; set to a fixture for an end-to-end test)'
+      catalog_url:
+        description: 'Override the resale catalog JSON URL (point at a fixture for an end-to-end test)'
+        required: false
+        default: ''
+      items_url_template:
+        description: 'Override the per-match resale items URL; {id} is replaced by the performanceId'
+        required: false
+        default: ''
+      shop_url:
+        description: 'Override the main shop performance-list URL'
         required: false
         default: ''
 
@@ -17,11 +25,13 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 6       # 4 fetches, each up to 3 attempts of 20 s + 15 s pause if the waiting room interferes
     steps:
       - uses: actions/checkout@v7
-      - name: Check resale page and notify phone
+      - name: Check resale site and main shop, notify phone
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          RESALE_URL: ${{ inputs.url }}
+          CATALOG_URL: ${{ inputs.catalog_url }}
+          ITEMS_URL_TEMPLATE: ${{ inputs.items_url_template }}
+          SHOP_URL: ${{ inputs.shop_url }}
         run: bash check.sh

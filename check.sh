@@ -1,73 +1,231 @@
 #!/usr/bin/env bash
-# Polls NFF's official resale page and pushes a phone notification via ntfy.sh
-# when tickets for Norway-Denmark or Norway-Portugal are listed.
+# Watches NFF's official resale site and the main ticket shop for tickets to
+# Norway-Denmark (24 Sep 2026) and Norway-Portugal (27 Sep 2026) and pushes a
+# phone notification via ntfy.sh.
+#
+# What is checked on every run (all server-side data, no JavaScript needed):
+#   1. resale catalog JSON   /list/resale/resaleProductCatalog.json
+#        -> availableQuantity of the "Mens Nations League" product (all its matches)
+#   2. per-match resale JSON /selection/resale/resaleItems.json?performanceId=<id>
+#        -> number of tickets listed for Denmark and for Portugal specifically
+#   3. main shop HTML        billett.fotball.no/selection/event/date?productId=...
+#        -> per-match "sold_out" status class (catches a release of returned tickets)
+# The resale HTML list page is NOT used: its "no tickets" text is always present
+# in the HTML (JavaScript unhides it), and its product name never contains an
+# opponent, so grepping it can never detect a listing.
+#
+# The sites sit behind a SecuTix virtual waiting room that sometimes redirects
+# requests to a queue page; fetches follow redirects with a cookie jar, retry,
+# and report QUEUE if still blocked.
 #
 # Env:
-#   NTFY_TOPIC   ntfy.sh topic to publish to (required unless DRY_RUN=1)
-#   RESALE_URL   page to check (default: the real resale page; set to a fixture for tests)
-#   KEYWORDS     regex of match names to alert on (default: Danmark|Denmark|Portugal)
-#   HTML_FILE    test hook: read the page from this file instead of fetching it
-#   NOW_HOUR / NOW_MINUTE   test hook: override the UTC clock
-#   DRY_RUN=1    print "NOTIFY ..." lines instead of calling ntfy.sh
+#   NTFY_TOPIC            ntfy.sh topic to publish to (required unless DRY_RUN=1)
+#   CATALOG_URL, ITEMS_URL_TEMPLATE ({id} placeholder), SHOP_URL
+#                         override the three URLs (end-to-end tests against fixtures)
+#   CATALOG_FILE, ITEMS_FILE_TEMPLATE ({id}), SHOP_FILE
+#                         test hooks: read these files instead of fetching
+#   NOW_HOUR / NOW_MINUTE test hook: override the UTC clock
+#   RETRY_SLEEP           seconds between fetch attempts (default 15)
+#   DRY_RUN=1             print "NOTIFY ..." lines instead of calling ntfy.sh
 #
 # Always exits 0 so a flaky fetch does not trigger GitHub's failure e-mails;
-# persistent fetch failures are reported hourly via ntfy instead.
+# persistent problems are reported hourly via ntfy instead.
 set -u
 
-URL=${RESALE_URL:-'https://resale.fotball.no/list/resaleProducts/?lang=en'}   # RESALE_URL overrides (end-to-end tests)
-EMPTY_MARKER='no tickets being resold'
-KEYWORDS=${KEYWORDS:-'Danmark|Denmark|Portugal'}
+# --- configuration -------------------------------------------------------------
+CATALOG_URL=${CATALOG_URL:-'https://resale.fotball.no/list/resale/resaleProductCatalog.json?lang=en'}
+ITEMS_URL_TEMPLATE=${ITEMS_URL_TEMPLATE:-'https://resale.fotball.no/selection/resale/resaleItems.json?performanceId={id}&lang=en'}
+SHOP_URL=${SHOP_URL:-'https://billett.fotball.no/selection/event/date?productId=10229739619905&lang=en'}
+PRODUCT_ID=${PRODUCT_ID:-10229739619905}          # "Mens Nations League" (24 Sep, 27 Sep, 14 Nov)
+PRODUCT_NAME_RE=${PRODUCT_NAME_RE:-'Nations League'} # fallback if the id ever changes
+MATCHES=${MATCHES:-'10229739913106:Denmark 10229739913107:Portugal'}
+LIST_PAGE='https://resale.fotball.no/list/resaleProducts/?lang=en'
+SHOP_PAGE='https://billett.fotball.no/selection/event/date?productId=10229739619905&lang=en'
+match_page() { echo "https://resale.fotball.no/selection/resale/item?performanceId=$1&checkResaleAvailability=true"; }
+UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) nff-resale-watch'
+ATTEMPTS=3
+RETRY_SLEEP=${RETRY_SLEEP:-15}
 NTFY_TOPIC=${NTFY_TOPIC:-}
+
 hour=${NOW_HOUR:-$(date -u +%H)}
 minute=${NOW_MINUTE:-$(date -u +%M)}
 # "Top of hour" = minutes 00-04: runs are triggered on the :00 mark, but the runner
 # may start up to a few minutes late. Only one 5-minute slot falls in this window.
 top_of_hour=false; case "$minute" in 0[0-4]|[0-4]) top_of_hour=true ;; esac
 
-notify() {  # notify <priority> <title> <message>
-  local priority=$1 title=$2 message=$3
+cd "$(dirname "$0")"
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+JAR="$work/cookies.txt"
+PY=''
+for c in python3 python; do "$c" -c 'import sys' >/dev/null 2>&1 && { PY=$c; break; }; done
+
+notify() {  # notify <priority> <title> <click url> <message>
+  local priority=$1 title=$2 click=$3 message=$4
   if [ "${DRY_RUN:-0}" = "1" ]; then
-    echo "NOTIFY priority=$priority title=$title click=$URL msg=$message"
+    echo "NOTIFY priority=$priority title=$title click=$click msg=$message"
     return
   fi
   if [ -z "$NTFY_TOPIC" ]; then echo "NTFY_TOPIC not set; cannot notify" >&2; return; fi
   curl -fsS -o /dev/null -X POST "https://ntfy.sh/$NTFY_TOPIC" \
     -H "Title: $title" -H "Priority: $priority" -H "Tags: soccer,ticket" \
-    -H "Click: $URL" -d "$message" \
+    -H "Click: $click" -d "$message" \
     && echo "notified ($priority): $message" \
     || echo "ntfy publish failed" >&2
 }
 
-# --- fetch -------------------------------------------------------------------
-html=''; fetch_error=''
-if [ -n "${HTML_FILE:-}" ]; then
-  html=$(cat "$HTML_FILE" 2>/dev/null) || fetch_error="cannot read $HTML_FILE"
-else
-  html=$(curl -sS -A 'Mozilla/5.0' --max-time 30 -w '\n%{http_code}' "$URL" 2>&1)
-  code=${html##*$'\n'}; html=${html%$'\n'*}
-  [ "$code" = "200" ] || fetch_error="HTTP $code"
-fi
-[ -z "$fetch_error" ] && [ -z "$html" ] && fetch_error="empty response"
+is_waiting_room() { grep -q '<title>Waiting Room</title>' "$1" 2>/dev/null; }
 
-stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-# --- classify ----------------------------------------------------------------
-if [ -n "$fetch_error" ]; then
-  echo "$stamp state=ERROR $fetch_error"
-  $top_of_hour && notify default 'NFF resale watcher' "fetch failed: $fetch_error (still failing at next full hour = check the workflow)"
-elif grep -qi -- "$EMPTY_MARKER" <<<"$html"; then
-  echo "$stamp state=EMPTY"
-  if [ "$hour" = "08" ] && $top_of_hour; then
-    notify low 'NFF resale watcher' 'Still watching. Nothing listed on resale.fotball.no.'
+# fetch <url> <outfile> [<test hook file>] -> FETCH=OK|QUEUE|ERROR, FETCH_ERR=<detail>
+fetch() {
+  local url=$1 out=$2 hook=${3:-} attempt res code final
+  FETCH=ERROR; FETCH_ERR=''
+  if [ -n "$hook" ]; then
+    if cp "$hook" "$out" 2>/dev/null; then
+      if is_waiting_room "$out"; then FETCH=QUEUE; FETCH_ERR='waiting room'; else FETCH=OK; fi
+    else
+      FETCH_ERR="cannot read $hook"
+    fi
+    return
   fi
-else
-  hits=$(grep -oiE -- "$KEYWORDS" <<<"$html" | sort -fu | paste -sd, -)
-  if [ -n "$hits" ]; then
-    echo "$stamp state=HIT $hits"
-    notify urgent 'TICKETS LISTED on NFF resale!' "Listings matching: $hits. Open resale.fotball.no now."
+  for attempt in $(seq 1 "$ATTEMPTS"); do
+    res=$(curl -sS -L -A "$UA" --max-time 20 -c "$JAR" -b "$JAR" -o "$out" \
+          -w '%{http_code} %{url_effective}' "$url" 2>"$work/curl.err") || res="000 -"
+    code=${res%% *}; final=${res#* }
+    if [[ "$final" == *pkpcontroller* ]] || is_waiting_room "$out"; then
+      FETCH=QUEUE; FETCH_ERR="waiting room after $attempt attempt(s)"
+    elif [ "$code" = "200" ]; then
+      FETCH=OK; FETCH_ERR=''; return
+    else
+      FETCH=ERROR; FETCH_ERR="HTTP $code $(head -c 80 "$work/curl.err" 2>/dev/null | tr -d '\n')"
+      [ "$code" = "000" ] || return           # a real HTTP error: no point retrying
+    fi
+    [ "$attempt" -lt "$ATTEMPTS" ] && sleep "$RETRY_SLEEP"
+  done
+}
+
+parse() {  # run parse.py; strip any CR a Windows python may emit; keep its exit status
+  local out rc
+  out=$("$PY" parse.py "$@" 2>"$work/parse.err"); rc=$?
+  printf '%s' "${out//$'\r'/}"
+  return $rc
+}
+parse_err() { head -c 120 "$work/parse.err" | tr -d '\n'; }
+
+if [ -z "$PY" ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) resale=ERROR qty=- shop=ERROR (python not found)"
+  $top_of_hour && notify default 'NFF resale watcher' "$LIST_PAGE" 'fetch failed: python not found on the runner (check the workflow)'
+  exit 0
+fi
+
+# --- 1. resale catalog ---------------------------------------------------------
+resale_state=''; resale_err=''; qty='-'; others=''
+fetch "$CATALOG_URL" "$work/catalog.json" "${CATALOG_FILE:-}"
+case $FETCH in
+  OK)
+    if parsed=$(parse catalog "$work/catalog.json" "$PRODUCT_ID" "$PRODUCT_NAME_RE"); then
+      qty=$(sed -n 's/^qty=//p' <<<"$parsed"); others=$(sed -n 's/^others=//p' <<<"$parsed")
+      [ "$qty" = "missing" ] && { resale_state=ERROR; resale_err="Nations League product not found in the resale catalog"; }
+    else
+      resale_state=ERROR; resale_err="catalog parse: $(parse_err)"
+    fi ;;
+  QUEUE) resale_state=QUEUE; resale_err="catalog: $FETCH_ERR" ;;
+  *)     resale_state=ERROR; resale_err="catalog: $FETCH_ERR" ;;
+esac
+
+# --- 2. per-match resale items ---------------------------------------------------
+counts_log=''; hit_lines=''; hit_click=''; items_err=''; heartbeat_resale=''
+for m in $MATCHES; do
+  id=${m%%:*}; name=${m#*:}
+  url=${ITEMS_URL_TEMPLATE//\{id\}/$id}
+  hook=''; [ -n "${ITEMS_FILE_TEMPLATE:-}" ] && hook=${ITEMS_FILE_TEMPLATE//\{id\}/$id}
+  fetch "$url" "$work/items-$id.json" "$hook"
+  count=ERR
+  if [ "$FETCH" = OK ]; then
+    if c=$(parse items "$work/items-$id.json"); then count=${c#count=}; else items_err="$name items parse: $(parse_err)"; fi
+  elif [ "$FETCH" = QUEUE ]; then count=QUEUE
+  else items_err="$name items: $FETCH_ERR"
+  fi
+  counts_log+="${name,,}=$count "
+  heartbeat_resale+="$name $count, "
+  if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -gt 0 ]; then
+    hit_lines+="$name: $count tickets. "
+    [ -z "$hit_click" ] && hit_click=$(match_page "$id")
   else
-    echo "$stamp state=SOMETHING"
-    $top_of_hour && notify default 'NFF resale: page not empty' 'Something is listed (other match?). Worth a look.'
+    hit_lines+="$name: ${count/ERR/?}. "
+  fi
+done
+counts_log=${counts_log% }; heartbeat_resale=${heartbeat_resale%, }
+
+# --- classify resale -----------------------------------------------------------
+if [ -n "$hit_click" ]; then
+  resale_state=HIT
+  resale_msg="${hit_lines}Nations League total ${qty/-/?}. Open resale.fotball.no now."
+elif [ -z "$resale_state" ]; then
+  if [[ "$qty" =~ ^[0-9]+$ ]] && [ "$qty" -gt 0 ]; then
+    resale_state=HIT; hit_click=$LIST_PAGE
+    resale_msg="Nations League resale shows $qty ticket(s) but none for Denmark or Portugal. Could be the 14 Nov match. Check resale.fotball.no."
+  elif [ -n "$others" ]; then
+    resale_state=SOMETHING
+  else
+    resale_state=EMPTY
+  fi
+fi
+
+# --- 3. main shop --------------------------------------------------------------
+shop_state=''; shop_err=''; onsale=''; heartbeat_shop=''
+fetch "$SHOP_URL" "$work/shop.html" "${SHOP_FILE:-}"
+case $FETCH in
+  OK)
+    # shellcheck disable=SC2086
+    if parsed=$(parse shop "$work/shop.html" $MATCHES); then
+      while IFS='=' read -r name st; do
+        [ -z "$name" ] && continue
+        case $st in
+          soldout)  heartbeat_shop+="$name sold out, " ;;
+          onsale*)  heartbeat_shop+="$name ON SALE, "; onsale+="$name," ;;
+          *)        heartbeat_shop+="$name unknown, "; shop_err="shop parse: no status found for $name" ;;
+        esac
+      done <<<"$parsed"
+      heartbeat_shop=${heartbeat_shop%, }; onsale=${onsale%,}
+      if [ -n "$onsale" ]; then shop_state="ONSALE:$onsale"
+      elif [ -n "$shop_err" ]; then shop_state=ERROR
+      else shop_state=SOLDOUT; fi
+    else
+      shop_state=ERROR; shop_err="shop parse: $(parse_err)"
+    fi ;;
+  QUEUE) shop_state=QUEUE; shop_err="shop: $FETCH_ERR" ;;
+  *)     shop_state=ERROR; shop_err="shop: $FETCH_ERR" ;;
+esac
+
+# --- report ----------------------------------------------------------------------
+stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+echo "$stamp resale=$resale_state qty=$qty $counts_log shop=$shop_state"
+[ -n "$resale_err" ] && echo "  $resale_err"
+[ -n "$items_err" ] && echo "  $items_err"
+[ -n "$shop_err" ] && echo "  $shop_err"
+
+urgent=false
+if [ "$resale_state" = HIT ]; then
+  notify urgent 'TICKETS LISTED on NFF resale!' "$hit_click" "$resale_msg"; urgent=true
+fi
+if [[ "$shop_state" == ONSALE:* ]]; then
+  notify urgent 'TICKETS ON SALE at billett.fotball.no!' "$SHOP_PAGE" "${onsale//,/ and } no longer marked sold out on billett.fotball.no. Buy now."; urgent=true
+fi
+
+if ! $urgent && $top_of_hour; then
+  sent=false
+  if [ "$resale_state" = SOMETHING ]; then
+    notify default 'NFF resale: other tickets listed' "$LIST_PAGE" "$others (not Nations League). Worth a look."; sent=true
+  fi
+  if [ "$resale_state" = QUEUE ] || [ "$shop_state" = QUEUE ] || [[ "$counts_log" == *QUEUE* ]]; then
+    notify default 'NFF resale watcher' "$LIST_PAGE" "waiting room blocked the check this hour ($resale_err $shop_err). Retrying every 5 min."; sent=true
+  fi
+  errs="$resale_err $items_err $shop_err"
+  if [ "$resale_state" = ERROR ] || [ "$shop_state" = ERROR ] || [ -n "$items_err" ]; then
+    notify default 'NFF resale watcher' "$LIST_PAGE" "fetch failed: ${errs## } (still failing at next full hour = check the workflow)"; sent=true
+  fi
+  if ! $sent && [ "$hour" = "08" ]; then
+    notify low 'NFF resale watcher' "$LIST_PAGE" "Still watching. Resale: Nations League $qty tickets ($heartbeat_resale). Shop: $heartbeat_shop."
   fi
 fi
 exit 0
