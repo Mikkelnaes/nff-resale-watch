@@ -1,0 +1,21 @@
+name: watch-resale
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes (GitHub's minimum; may lag a few minutes)
+  workflow_dispatch:         # manual "Run workflow" button for testing
+
+concurrency:
+  group: watch-resale
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check resale page and notify phone
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: bash check.sh
