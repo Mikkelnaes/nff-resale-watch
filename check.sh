@@ -20,7 +20,9 @@ KEYWORDS=${KEYWORDS:-'Danmark|Denmark|Portugal'}
 NTFY_TOPIC=${NTFY_TOPIC:-}
 hour=${NOW_HOUR:-$(date -u +%H)}
 minute=${NOW_MINUTE:-$(date -u +%M)}
-top_of_hour=false; [ "$minute" = "00" ] && top_of_hour=true
+# "Top of hour" = minutes 00-04: runs are triggered on the :00 mark, but the runner
+# may start up to a few minutes late. Only one 5-minute slot falls in this window.
+top_of_hour=false; case "$minute" in 0[0-4]|[0-4]) top_of_hour=true ;; esac
 
 notify() {  # notify <priority> <title> <message>
   local priority=$1 title=$2 message=$3

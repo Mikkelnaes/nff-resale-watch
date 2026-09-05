@@ -50,6 +50,10 @@ assert_notify_count   "empty page at 08:00 UTC sends one heartbeat" 1
 assert_contains       "heartbeat is low priority" "NOTIFY priority=low"
 run "$tmp/empty.html" 09 00
 assert_notify_count   "empty page at 09:00 UTC sends no heartbeat" 0
+run "$tmp/empty.html" 08 03
+assert_notify_count   "empty page at 08:03 UTC (runner started late) still sends the heartbeat" 1
+run "$tmp/empty.html" 08 05
+assert_notify_count   "empty page at 08:05 UTC (next 5-min slot) sends no second heartbeat" 0
 
 echo "# Denmark / Portugal listing"
 run "$tmp/denmark.html" 14 30
@@ -72,6 +76,8 @@ assert_notify_count   "other mid-hour sends nothing" 0
 run "$tmp/other.html" 14 00
 assert_notify_count   "other at top of hour sends one notification" 1
 assert_contains       "other notification is default priority" "NOTIFY priority=default"
+run "$tmp/other.html" 14 04
+assert_notify_count   "other at 14:04 (runner started late) still sends one notification" 1
 
 echo "# fetch failure"
 run "$tmp/does-not-exist.html" 14 30
@@ -81,6 +87,8 @@ assert_notify_count   "fetch failure mid-hour sends nothing" 0
 run "$tmp/does-not-exist.html" 14 00
 assert_notify_count   "fetch failure at top of hour sends one notification" 1
 assert_contains       "fetch failure notification says fetch failed" "fetch failed"
+run "$tmp/does-not-exist.html" 14 02
+assert_notify_count   "fetch failure at 14:02 (runner started late) still sends one notification" 1
 
 echo "# URL override (for end-to-end tests against a fixture page)"
 out=$(HTML_FILE="$tmp/denmark.html" NOW_HOUR=14 NOW_MINUTE=30 DRY_RUN=1 NTFY_TOPIC=test-topic RESALE_URL="https://example.test/fixture.html" bash ./check.sh 2>&1); rc=$?
