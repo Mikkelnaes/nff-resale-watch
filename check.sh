@@ -4,6 +4,7 @@
 #
 # Env:
 #   NTFY_TOPIC   ntfy.sh topic to publish to (required unless DRY_RUN=1)
+#   RESALE_URL   page to check (default: the real resale page; set to a fixture for tests)
 #   KEYWORDS     regex of match names to alert on (default: Danmark|Denmark|Portugal)
 #   HTML_FILE    test hook: read the page from this file instead of fetching it
 #   NOW_HOUR / NOW_MINUTE   test hook: override the UTC clock
@@ -13,7 +14,7 @@
 # persistent fetch failures are reported hourly via ntfy instead.
 set -u
 
-URL='https://resale.fotball.no/list/resaleProducts/?lang=en'
+URL=${RESALE_URL:-'https://resale.fotball.no/list/resaleProducts/?lang=en'}   # RESALE_URL overrides (end-to-end tests)
 EMPTY_MARKER='no tickets being resold'
 KEYWORDS=${KEYWORDS:-'Danmark|Denmark|Portugal'}
 NTFY_TOPIC=${NTFY_TOPIC:-}

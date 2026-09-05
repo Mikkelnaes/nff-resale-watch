@@ -82,6 +82,12 @@ run "$tmp/does-not-exist.html" 14 00
 assert_notify_count   "fetch failure at top of hour sends one notification" 1
 assert_contains       "fetch failure notification says fetch failed" "fetch failed"
 
+echo "# URL override (for end-to-end tests against a fixture page)"
+out=$(HTML_FILE="$tmp/denmark.html" NOW_HOUR=14 NOW_MINUTE=30 DRY_RUN=1 NTFY_TOPIC=test-topic RESALE_URL="https://example.test/fixture.html" bash ./check.sh 2>&1); rc=$?
+assert_contains     "RESALE_URL override is used for the click link" "click=https://example.test/fixture.html"
+run "$tmp/denmark.html" 14 30
+assert_contains     "without override the click link is the real resale page" "click=https://resale.fotball.no/list/resaleProducts/?lang=en"
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

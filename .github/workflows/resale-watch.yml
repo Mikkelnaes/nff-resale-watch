@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '0,5,10,15,20,25,30,35,40,45,50,55 * * * *'   # every 5 minutes (GitHub's minimum; may lag)
   workflow_dispatch:         # manual "Run workflow" button for testing
+    inputs:
+      url:
+        description: 'Page URL to check (leave empty for the real resale page; set to a fixture for an end-to-end test)'
+        required: false
+        default: ''
 
 concurrency:
   group: watch-resale
@@ -18,4 +23,5 @@ jobs:
       - name: Check resale page and notify phone
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          RESALE_URL: ${{ inputs.url }}
         run: bash check.sh
