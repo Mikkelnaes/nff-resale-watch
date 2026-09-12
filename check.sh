@@ -25,12 +25,15 @@
 #   CATALOG_FILE, ITEMS_FILE_TEMPLATE ({id}), SHOP_FILE
 #                         test hooks: read these files instead of fetching
 #   NOW_HOUR / NOW_MINUTE test hook: override the UTC clock
-#   RETRY_SLEEP           seconds between fetch attempts (default 10)
+#   PASSES / PASS_GAP     reads per run and seconds between them (default 2 / 30): the job
+#                         is started every minute, so the sites are read every ~30 s
+#   RETRY_SLEEP           seconds between fetch attempts (default 5)
 #   DEDUPE_WINDOW         non-urgent notices are skipped if the same title was already
 #                         published to the topic within this window (default 20m); the
 #                         workflow runs every minute, so several runs land in the
 #                         "top of hour" window
 #   RECENT_FILE           test hook: ntfy JSON-lines file used instead of asking ntfy.sh
+#                         ({pass} in any test-hook path is replaced by the pass number)
 #   DRY_RUN=1             print "NOTIFY ..." lines instead of calling ntfy.sh
 #
 # Always exits 0 so a flaky fetch does not trigger GitHub's failure e-mails;
@@ -48,9 +51,12 @@ LIST_PAGE='https://resale.fotball.no/list/resaleProducts/?lang=en'
 SHOP_PAGE='https://billett.fotball.no/selection/event/date?productId=10229739619905&lang=en'
 match_page() { echo "https://resale.fotball.no/selection/resale/item?performanceId=$1&checkResaleAvailability=true"; }
 UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) nff-resale-watch'
-ATTEMPTS=3
-RETRY_SLEEP=${RETRY_SLEEP:-10}
+ATTEMPTS=${ATTEMPTS:-2}
+RETRY_SLEEP=${RETRY_SLEEP:-5}
 DEDUPE_WINDOW=${DEDUPE_WINDOW:-20m}
+PASSES=${PASSES:-2}        # reads per run
+PASS_GAP=${PASS_GAP:-30}   # seconds between the start of consecutive passes
+MAX_RUN=${MAX_RUN:-50}     # skip remaining passes once the run is this old (the next run starts every minute)
 NTFY_TOPIC=${NTFY_TOPIC:-}
 
 hour=${NOW_HOUR:-$(date -u +%H)}
@@ -140,6 +146,7 @@ parse() {  # run parse.py; strip any CR a Windows python may emit; keep its exit
   return $rc
 }
 parse_err() { head -c 120 "$work/parse.err" | tr -d '\n'; }
+hook() { printf '%s' "${1//\{pass\}/$2}"; }   # hook <test hook path> <pass>
 
 if [ -z "$PY" ]; then
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) resale=ERROR qty=- shop=ERROR (python not found)"
@@ -147,9 +154,11 @@ if [ -z "$PY" ]; then
   exit 0
 fi
 
+run_pass() {  # run_pass <n>: fetch, classify, notify
+  local pass=$1
 # --- 1. resale catalog ---------------------------------------------------------
 resale_state=''; resale_err=''; qty='-'; others=''
-fetch "$CATALOG_URL" "$work/catalog.json" "${CATALOG_FILE:-}"
+fetch "$CATALOG_URL" "$work/catalog.json" "$(hook "${CATALOG_FILE:-}" "$pass")"
 case $FETCH in
   OK)
     if parsed=$(parse catalog "$work/catalog.json" "$PRODUCT_ID" "$PRODUCT_NAME_RE"); then
@@ -167,8 +176,8 @@ counts_log=''; hit_lines=''; hit_click=''; items_err=''; heartbeat_resale=''
 for m in $MATCHES; do
   id=${m%%:*}; name=${m#*:}
   url=${ITEMS_URL_TEMPLATE//\{id\}/$id}
-  hook=''; [ -n "${ITEMS_FILE_TEMPLATE:-}" ] && hook=${ITEMS_FILE_TEMPLATE//\{id\}/$id}
-  fetch "$url" "$work/items-$id.json" "$hook"
+  hookfile=''; [ -n "${ITEMS_FILE_TEMPLATE:-}" ] && hookfile=$(hook "${ITEMS_FILE_TEMPLATE//\{id\}/$id}" "$pass")
+  fetch "$url" "$work/items-$id.json" "$hookfile"
   count=ERR
   if [ "$FETCH" = OK ]; then
     if c=$(parse items "$work/items-$id.json"); then count=${c#count=}; else items_err="$name items parse: $(parse_err)"; fi
@@ -203,7 +212,7 @@ fi
 
 # --- 3. main shop --------------------------------------------------------------
 shop_state=''; shop_err=''; onsale=''; heartbeat_shop=''
-fetch "$SHOP_URL" "$work/shop.html" "${SHOP_FILE:-}"
+fetch "$SHOP_URL" "$work/shop.html" "$(hook "${SHOP_FILE:-}" "$pass")"
 case $FETCH in
   OK)
     # shellcheck disable=SC2086
@@ -229,7 +238,7 @@ esac
 
 # --- report ----------------------------------------------------------------------
 stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-echo "$stamp resale=$resale_state qty=$qty $counts_log shop=$shop_state"
+echo "$stamp pass=$pass/$PASSES resale=$resale_state qty=$qty $counts_log shop=$shop_state"
 [ -n "$resale_err" ] && echo "  $resale_err"
 [ -n "$items_err" ] && echo "  $items_err"
 [ -n "$shop_err" ] && echo "  $shop_err"
@@ -242,7 +251,7 @@ if [[ "$shop_state" == ONSALE:* ]]; then
   notify urgent 'TICKETS ON SALE at billett.fotball.no!' "$SHOP_PAGE" "${onsale//,/ and } no longer marked sold out on billett.fotball.no. Buy now."; urgent=true
 fi
 
-if ! $urgent && $top_of_hour; then
+if ! $urgent && $top_of_hour && [ "$pass" = 1 ]; then   # hourly notices / heartbeat: first pass only
   sent=false
   if [ "$resale_state" = SOMETHING ]; then
     notify_once default 'NFF resale: other tickets listed' "$LIST_PAGE" "$others (not Nations League). Worth a look."; sent=true
@@ -258,4 +267,17 @@ if ! $urgent && $top_of_hour; then
     notify_once low 'NFF resale watcher' "$LIST_PAGE" "Still watching. Resale: Nations League $qty tickets ($heartbeat_resale). Shop: $heartbeat_shop."
   fi
 fi
+}
+
+# --- run: PASSES reads, PASS_GAP seconds apart ---------------------------------
+start=$(date +%s)
+for ((pass=1; pass<=PASSES; pass++)); do
+  if [ "$pass" -gt 1 ]; then
+    now=$(date +%s); wait=$(( start + (pass-1)*PASS_GAP - now ))
+    [ "$wait" -gt 0 ] && sleep "$wait"
+    now=$(date +%s)
+    if [ $((now - start)) -gt "$MAX_RUN" ]; then echo "pass $pass/$PASSES skipped: run already $((now - start)) s old"; break; fi
+  fi
+  run_pass "$pass"
+done
 exit 0

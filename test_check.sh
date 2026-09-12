@@ -19,7 +19,7 @@ run() {  # run <catalog fixture> <denmark items fixture> <portugal items fixture
   [ "$2" != MISSING ] && cp "$2" "$tmp/items-$DK.json"
   [ "$3" != MISSING ] && cp "$3" "$tmp/items-$PT.json"
   out=$(CATALOG_FILE="$1" ITEMS_FILE_TEMPLATE="$tmp/items-{id}.json" SHOP_FILE="$4" NOW_HOUR="$5" NOW_MINUTE="$6" \
-        RECENT_FILE="${RECENT:-}" RETRY_SLEEP=0 DRY_RUN=1 NTFY_TOPIC=test-topic bash ./check.sh 2>&1)
+        RECENT_FILE="${RECENT:-}" PASSES="${PASSES_T:-1}" PASS_GAP=0 RETRY_SLEEP=0 DRY_RUN=1 NTFY_TOPIC=test-topic bash ./check.sh 2>&1)
   rc=$?
 }
 ok() { pass=$((pass+1)); echo "ok   - $1"; }
@@ -166,6 +166,24 @@ assert_notify_count   "a recent message with a different title does not suppress
 RECENT=''
 run $E $IE $IE $SS 08 00
 assert_notify_count   "with no recent messages the heartbeat is sent" 1
+
+echo "# two passes per run (PASSES=2): the site is read twice, 30 s apart in production"
+PASSES_T=2
+run $E $IE $IE $SS 14 30
+assert_contains       "two-pass quiet run logs pass 1" "pass=1/2"
+assert_contains       "two-pass quiet run logs pass 2" "pass=2/2"
+assert_notify_count   "two-pass quiet run sends nothing" 0
+run $E $IE $IE $SS 08 00
+assert_notify_count   "heartbeat is sent once, not once per pass" 1
+cp $E "$tmp/cat-p1.json"; cp $H "$tmp/cat-p2.json"
+run "$tmp/cat-p{pass}.json" $IE $IE $SS 14 30
+assert_contains       "a listing that appears only in pass 2 is seen (pass 1 EMPTY)" "pass=1/2 resale=EMPTY"
+assert_contains       "  ...pass 2 reports HIT" "pass=2/2 resale=HIT"
+assert_notify_count   "  ...and one urgent alert goes out" 1
+assert_contains       "  ...which is urgent" "NOTIFY priority=urgent"
+run $H $IH $IE $SS 14 30
+assert_notify_count   "a listing present in both passes alerts in both (urgent never throttled)" 2
+PASSES_T=1
 
 echo "# both channels at once"
 run $H $IH $IE $SD 14 30

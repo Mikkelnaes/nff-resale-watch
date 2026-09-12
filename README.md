@@ -3,8 +3,10 @@
 Watches for tickets to Norway-Denmark (24 Sep 2026) and Norway-Portugal
 (27 Sep 2026, both Ullevaal, UEFA Nations League) and pushes a notification to
 your phone via [ntfy.sh](https://ntfy.sh). Runs on GitHub Actions every minute,
-started by an external cron (see below). On 12 Sep 2026 it caught a real listing
-of 4 Denmark tickets that was gone again within 5 minutes, hence the 1-minute cadence.
+started by an external cron (see below), and reads the sites twice per run, 30 s
+apart, so a listing is noticed within about 30 s. On 12 Sep 2026 it caught real
+listings of 4 and then 1 Denmark tickets that were gone again within 5 minutes and
+45 seconds respectively, hence the cadence.
 
 ## What is checked
 
@@ -32,14 +34,14 @@ exactly that and would have stayed silent.
 
 | Situation | Priority | When |
 |---|---|---|
-| Denmark or Portugal items listed, or Nations League quantity > 0 | urgent, links to the match page | every run until you stop the job |
-| A September match no longer `sold_out` on billett.fotball.no | urgent, links to the shop | every run |
+| Denmark or Portugal items listed, or Nations League quantity > 0 | urgent, links to the match page | every pass (about every 30 s) until you stop the job |
+| A September match no longer `sold_out` on billett.fotball.no | urgent, links to the shop | every pass |
 | Some other product has resale tickets | default | once an hour |
 | Waiting room blocked a fetch, or a fetch/parse failed | default | once an hour (after 3 attempts inside the run) |
 | Everything quiet | low "Still watching" heartbeat with the parsed numbers | daily 08:00 UTC |
 
-"Once an hour" means the runs that land in minutes :00-:04 UTC. Because the job runs
-every minute, several runs fall in that window; before sending a non-urgent notice
+"Once an hour" means the runs that land in minutes :00-:04 UTC (first pass only).
+Because the job runs every minute, several runs fall in that window; before sending a non-urgent notice
 the script reads the topic's own recent messages (`ntfy.sh/<topic>/json?since=20m`)
 and skips the notice if one with the same title already went out. Urgent alerts are
 never deduplicated: they repeat every minute while tickets are listed.
