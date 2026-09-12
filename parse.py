@@ -7,6 +7,9 @@
         others=<"name: qty" of every other product with qty > 0, comma separated>
   parse.py items <file>
       Reads resaleItems.json (one performance). Prints  count=<len(resaleItems)>
+  parse.py titles <file>
+      Reads ntfy.sh JSON-lines (topic/json?poll=1&since=...). Prints the title of
+      every "message" event, one per line. Malformed lines are ignored.
   parse.py shop <file> <performanceId>:<Name> [...]
       Reads the main shop's performance-selection HTML. For each performance the
       status class of the block that ends at its "check_resale_<id>" anchor is
@@ -73,6 +76,20 @@ def cmd_shop(path, matches):
             print("%s=onsale(%s)" % (name, st))
 
 
+def cmd_titles(path):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("event", "message") == "message" and msg.get("title"):
+                print(msg["title"])
+
+
 def main(argv):
     # Plain "\n" line endings even on Windows, where text-mode stdout would emit "\r\n".
     try:
@@ -84,6 +101,8 @@ def main(argv):
             cmd_catalog(argv[1], argv[2], argv[3])
         elif argv[0] == "items":
             cmd_items(argv[1])
+        elif argv[0] == "titles":
+            cmd_titles(argv[1])
         elif argv[0] == "shop":
             cmd_shop(argv[1], argv[2:])
         else:

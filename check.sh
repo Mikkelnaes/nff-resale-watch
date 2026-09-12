@@ -25,7 +25,12 @@
 #   CATALOG_FILE, ITEMS_FILE_TEMPLATE ({id}), SHOP_FILE
 #                         test hooks: read these files instead of fetching
 #   NOW_HOUR / NOW_MINUTE test hook: override the UTC clock
-#   RETRY_SLEEP           seconds between fetch attempts (default 15)
+#   RETRY_SLEEP           seconds between fetch attempts (default 10)
+#   DEDUPE_WINDOW         non-urgent notices are skipped if the same title was already
+#                         published to the topic within this window (default 20m); the
+#                         workflow runs every minute, so several runs land in the
+#                         "top of hour" window
+#   RECENT_FILE           test hook: ntfy JSON-lines file used instead of asking ntfy.sh
 #   DRY_RUN=1             print "NOTIFY ..." lines instead of calling ntfy.sh
 #
 # Always exits 0 so a flaky fetch does not trigger GitHub's failure e-mails;
@@ -44,7 +49,8 @@ SHOP_PAGE='https://billett.fotball.no/selection/event/date?productId=10229739619
 match_page() { echo "https://resale.fotball.no/selection/resale/item?performanceId=$1&checkResaleAvailability=true"; }
 UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) nff-resale-watch'
 ATTEMPTS=3
-RETRY_SLEEP=${RETRY_SLEEP:-15}
+RETRY_SLEEP=${RETRY_SLEEP:-10}
+DEDUPE_WINDOW=${DEDUPE_WINDOW:-20m}
 NTFY_TOPIC=${NTFY_TOPIC:-}
 
 hour=${NOW_HOUR:-$(date -u +%H)}
@@ -71,6 +77,30 @@ notify() {  # notify <priority> <title> <click url> <message>
     -H "Click: $click" -d "$message" \
     && echo "notified ($priority): $message" \
     || echo "ntfy publish failed" >&2
+}
+
+# Non-urgent notices go out at most once per DEDUPE_WINDOW: the topic's own message
+# cache (ntfy.sh keeps 12 h) tells us what was already published. Fails open.
+recent_loaded=false; recent_titles=''
+load_recent() {
+  $recent_loaded && return; recent_loaded=true
+  local f="$work/recent.jsonl"
+  if [ -n "${RECENT_FILE:-}" ]; then
+    cp "$RECENT_FILE" "$f" 2>/dev/null || : > "$f"
+  elif [ "${DRY_RUN:-0}" = "1" ] || [ -z "$NTFY_TOPIC" ]; then
+    : > "$f"
+  else
+    curl -fsS --max-time 15 "https://ntfy.sh/$NTFY_TOPIC/json?poll=1&since=$DEDUPE_WINDOW" -o "$f" 2>/dev/null || : > "$f"
+  fi
+  recent_titles=$(parse titles "$f" || true)
+}
+notify_once() {  # notify_once <priority> <title> <click url> <message>; skipped if <title> was sent within DEDUPE_WINDOW
+  load_recent
+  if grep -qxF -- "$2" <<<"$recent_titles"; then
+    echo "skipped duplicate: '$2' already sent within $DEDUPE_WINDOW"
+    return
+  fi
+  notify "$@"
 }
 
 is_waiting_room() { grep -q '<title>Waiting Room</title>' "$1" 2>/dev/null; }
@@ -215,17 +245,17 @@ fi
 if ! $urgent && $top_of_hour; then
   sent=false
   if [ "$resale_state" = SOMETHING ]; then
-    notify default 'NFF resale: other tickets listed' "$LIST_PAGE" "$others (not Nations League). Worth a look."; sent=true
+    notify_once default 'NFF resale: other tickets listed' "$LIST_PAGE" "$others (not Nations League). Worth a look."; sent=true
   fi
   if [ "$resale_state" = QUEUE ] || [ "$shop_state" = QUEUE ] || [[ "$counts_log" == *QUEUE* ]]; then
-    notify default 'NFF resale watcher' "$LIST_PAGE" "waiting room blocked the check this hour ($resale_err $shop_err). Retrying every 5 min."; sent=true
+    notify_once default 'NFF resale watcher' "$LIST_PAGE" "waiting room blocked the check this hour ($resale_err $shop_err). Retrying every minute."; sent=true
   fi
   errs="$resale_err $items_err $shop_err"
   if [ "$resale_state" = ERROR ] || [ "$shop_state" = ERROR ] || [ -n "$items_err" ]; then
-    notify default 'NFF resale watcher' "$LIST_PAGE" "fetch failed: ${errs## } (still failing at next full hour = check the workflow)"; sent=true
+    notify_once default 'NFF resale watcher' "$LIST_PAGE" "fetch failed: ${errs## } (still failing at next full hour = check the workflow)"; sent=true
   fi
   if ! $sent && [ "$hour" = "08" ]; then
-    notify low 'NFF resale watcher' "$LIST_PAGE" "Still watching. Resale: Nations League $qty tickets ($heartbeat_resale). Shop: $heartbeat_shop."
+    notify_once low 'NFF resale watcher' "$LIST_PAGE" "Still watching. Resale: Nations League $qty tickets ($heartbeat_resale). Shop: $heartbeat_shop."
   fi
 fi
 exit 0

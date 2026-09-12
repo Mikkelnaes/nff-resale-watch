@@ -2,8 +2,9 @@
 
 Watches for tickets to Norway-Denmark (24 Sep 2026) and Norway-Portugal
 (27 Sep 2026, both Ullevaal, UEFA Nations League) and pushes a notification to
-your phone via [ntfy.sh](https://ntfy.sh). Runs on GitHub Actions every 5 minutes,
-started by an external cron (see below).
+your phone via [ntfy.sh](https://ntfy.sh). Runs on GitHub Actions every minute,
+started by an external cron (see below). On 12 Sep 2026 it caught a real listing
+of 4 Denmark tickets that was gone again within 5 minutes, hence the 1-minute cadence.
 
 ## What is checked
 
@@ -37,7 +38,11 @@ exactly that and would have stayed silent.
 | Waiting room blocked a fetch, or a fetch/parse failed | default | once an hour (after 3 attempts inside the run) |
 | Everything quiet | low "Still watching" heartbeat with the parsed numbers | daily 08:00 UTC |
 
-"Once an hour" means the run that lands in minutes :00-:04 UTC.
+"Once an hour" means the runs that land in minutes :00-:04 UTC. Because the job runs
+every minute, several runs fall in that window; before sending a non-urgent notice
+the script reads the topic's own recent messages (`ntfy.sh/<topic>/json?since=20m`)
+and skips the notice if one with the same title already went out. Urgent alerts are
+never deduplicated: they repeat every minute while tickets are listed.
 
 Both sites sit behind a SecuTix virtual waiting room that sometimes redirects a
 request to a queue page. Fetches follow redirects with a cookie jar, retry up to
@@ -56,8 +61,9 @@ real error in the run log:
 ## External trigger (cron-job.org)
 
 GitHub's `schedule` trigger fired only sporadically for this repo, so a free
-[cron-job.org](https://cron-job.org) job POSTs to the GitHub API every 5 minutes
-and starts the workflow.
+[cron-job.org](https://cron-job.org) job POSTs to the GitHub API every minute
+and starts the workflow. (GitHub occasionally cancels a queued duplicate when its
+own schedule collides with a dispatch; that shows as a "cancelled" run and is harmless.)
 
 1. Create a fine-grained personal access token at
    <https://github.com/settings/personal-access-tokens/new>:
@@ -67,8 +73,8 @@ and starts the workflow.
    - Expiration: 28 Sep 2026 (the day after the last match).
 2. Create a cronjob at <https://console.cron-job.org>:
    - URL: `https://api.github.com/repos/Mikkelnaes/nff-resale-watch/actions/workflows/resale-watch.yml/dispatches`
-   - Schedule: every 5 minutes on the marks (0,5,10,...,55). Keep it on the
-     marks: the :00 run carries the hourly notices and the 08:00 UTC heartbeat.
+   - Schedule: every minute ("* * * * *"). The runs landing in minutes :00-:04
+     carry the hourly notices and the 08:00 UTC heartbeat.
    - Advanced -> Request method: `POST`
    - Advanced -> Headers:
      - `Accept: application/vnd.github+json`
@@ -78,7 +84,7 @@ and starts the workflow.
    - Advanced -> Request body: `{"ref":"main"}`
    - Notifications: e-mail on failure. A successful call returns HTTP 204.
 3. Verify: `gh run list --repo Mikkelnaes/nff-resale-watch --limit 5` shows a
-   new `workflow_dispatch` run every 5 minutes.
+   new `workflow_dispatch` run every minute.
 
 ## End-to-end test (real phone alert from fixture data)
 

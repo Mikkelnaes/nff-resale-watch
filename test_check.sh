@@ -19,7 +19,7 @@ run() {  # run <catalog fixture> <denmark items fixture> <portugal items fixture
   [ "$2" != MISSING ] && cp "$2" "$tmp/items-$DK.json"
   [ "$3" != MISSING ] && cp "$3" "$tmp/items-$PT.json"
   out=$(CATALOG_FILE="$1" ITEMS_FILE_TEMPLATE="$tmp/items-{id}.json" SHOP_FILE="$4" NOW_HOUR="$5" NOW_MINUTE="$6" \
-        RETRY_SLEEP=0 DRY_RUN=1 NTFY_TOPIC=test-topic bash ./check.sh 2>&1)
+        RECENT_FILE="${RECENT:-}" RETRY_SLEEP=0 DRY_RUN=1 NTFY_TOPIC=test-topic bash ./check.sh 2>&1)
   rc=$?
 }
 ok() { pass=$((pass+1)); echo "ok   - $1"; }
@@ -139,6 +139,33 @@ assert_notify_count   "shop waiting room at top of hour sends one notification" 
 run $E $IE $IE "$tmp/nope.html" 14 30
 assert_contains       "shop fetch failure reports shop=ERROR" "shop=ERROR"
 assert_notify_count   "shop fetch failure mid-hour sends nothing" 0
+
+echo "# deduplication against messages already on the ntfy topic (1-minute cadence)"
+recent() {  # recent <title>... -> writes an ntfy-style JSON-lines file, sets RECENT
+  RECENT="$tmp/recent.jsonl"; : > "$RECENT"
+  for t in "$@"; do printf '{"id":"x","time":%s,"event":"message","topic":"test-topic","title":"%s","message":"m"}
+' "$(date +%s)" "$t" >> "$RECENT"; done
+}
+recent "NFF resale watcher"
+run $E $IE $IE $SS 08 01
+assert_notify_count   "heartbeat is skipped when the same title went out in the last 20 min" 0
+assert_contains       "  ...and the skip is logged" "skipped duplicate"
+recent "NFF resale: other tickets listed"
+run $O $IE $IE $SS 14 01
+assert_notify_count   "hourly other-product notice is skipped when already sent" 0
+recent "NFF resale watcher"
+run $WR $IE $IE $SS 14 02
+assert_notify_count   "hourly waiting-room notice is skipped when already sent" 0
+recent "TICKETS LISTED on NFF resale!"
+run $H $IH $IE $SS 14 30
+assert_notify_count   "urgent alerts are never deduplicated" 1
+assert_contains       "  ...and stay urgent" "NOTIFY priority=urgent"
+recent "TICKETS LISTED on NFF resale!"
+run $E $IE $IE $SS 08 00
+assert_notify_count   "a recent message with a different title does not suppress the heartbeat" 1
+RECENT=''
+run $E $IE $IE $SS 08 00
+assert_notify_count   "with no recent messages the heartbeat is sent" 1
 
 echo "# both channels at once"
 run $H $IH $IE $SD 14 30
