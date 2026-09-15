@@ -15,13 +15,16 @@ LIST_URL="https://resale.fotball.no/list/resaleProducts/?lang=en"
 SHOP_URL="https://billett.fotball.no/selection/event/date?productId=10229739619905&lang=en"
 
 run() {  # run <catalog fixture> <denmark items fixture> <portugal items fixture> <shop fixture> <hour> <minute>
-  rm -f "$tmp"/items-*.json
+  rm -f "$tmp"/items-*.json; rm -rf "$tmp/evidence"
   [ "$2" != MISSING ] && cp "$2" "$tmp/items-$DK.json"
   [ "$3" != MISSING ] && cp "$3" "$tmp/items-$PT.json"
   out=$(CATALOG_FILE="$1" ITEMS_FILE_TEMPLATE="$tmp/items-{id}.json" SHOP_FILE="$4" NOW_HOUR="$5" NOW_MINUTE="$6" \
+        ITEM_PAGE_FILE_TEMPLATE="${ITEMPAGE_T:-$F/item-page-hit.html}" EVIDENCE_DIR="$tmp/evidence" \
         RECENT_FILE="${RECENT:-}" PASSES="${PASSES_T:-1}" PASS_GAP=0 RETRY_SLEEP=0 DRY_RUN=1 NTFY_TOPIC=test-topic bash ./check.sh 2>&1)
   rc=$?
 }
+assert_file()    { [ -f "$2" ] && ok "$1" || ko "$1" "missing file $2"; }
+assert_no_path() { [ ! -e "$2" ] && ok "$1" || ko "$1" "unexpected path $2"; }
 ok() { pass=$((pass+1)); echo "ok   - $1"; }
 ko() { fail=$((fail+1)); echo "FAIL - $1"; echo "       $2"; printf '%s\n' "$out" | sed 's/^/       | /'; }
 assert_rc0()          { [ "$rc" -eq 0 ] && ok "$1" || ko "$1" "exit code was $rc"; }
@@ -189,6 +192,33 @@ echo "# both channels at once"
 run $H $IH $IE $SD 14 30
 assert_notify_count   "resale hit + shop on sale sends two urgent notifications" 2
 assert_not_contains   "  ...and nothing of lower priority" "priority=default"
+
+echo "# seat details in the alert and evidence capture on a hit (feeds the auto-basket userscript)"
+run $H $IH $IE $SS 14 30
+assert_contains       "hit alert lists section, row and seat" "B7 r12 s5"
+assert_contains       "hit alert lists the seat category" "Kategori 2"
+assert_contains       "hit alert lists the price" "450"
+assert_contains       "hit alert keeps the machine-readable count first" "Denmark: 2 tickets"
+assert_file           "hit saves the Denmark items JSON as evidence" "$tmp/evidence/items-$DK-p1.json"
+assert_file           "hit saves the Denmark match page as evidence" "$tmp/evidence/item-$DK-p1.html"
+assert_file           "hit saves the catalog as evidence" "$tmp/evidence/catalog-p1.json"
+assert_no_path        "no evidence for the quiet Portugal match" "$tmp/evidence/items-$PT-p1.json"
+assert_contains       "evidence capture is logged" "evidence:"
+n_notify=$(grep -n '^NOTIFY' <<<"$out" | head -1 | cut -d: -f1); n_evid=$(grep -n 'evidence:' <<<"$out" | head -1 | cut -d: -f1)
+[ -n "$n_notify" ] && [ -n "$n_evid" ] && [ "$n_notify" -lt "$n_evid" ] && ok "alert goes out before the evidence is fetched" || ko "alert goes out before the evidence is fetched" "notify line $n_notify, evidence line $n_evid"
+run $E $IE $IE $SS 14 30
+assert_no_path        "quiet run writes no evidence" "$tmp/evidence"
+ITEMPAGE_T="$tmp/no-such-page.html"
+run $H $IH $IE $SS 14 30
+assert_rc0            "match page fetch failure still exits 0"
+assert_notify_count   "  ...alert still sent" 1
+assert_file           "  ...items JSON still saved" "$tmp/evidence/items-$DK-p1.json"
+assert_contains       "  ...failure visible in the log" "item page ERROR"
+ITEMPAGE_T=''
+PASSES_T=2
+run $H $IH $IE $SS 14 30
+assert_file           "two-pass hit saves pass 2 evidence separately" "$tmp/evidence/items-$DK-p2.json"
+PASSES_T=1
 
 echo
 echo "$pass passed, $fail failed"

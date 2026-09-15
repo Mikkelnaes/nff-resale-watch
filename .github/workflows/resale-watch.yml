@@ -35,3 +35,10 @@ jobs:
           ITEMS_URL_TEMPLATE: ${{ inputs.items_url_template }}
           SHOP_URL: ${{ inputs.shop_url }}
         run: bash check.sh
+      - name: Upload evidence (only when tickets were listed)
+        if: ${{ hashFiles('evidence/**') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ github.run_id }}
+          path: evidence/
+          retention-days: 14

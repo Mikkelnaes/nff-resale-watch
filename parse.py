@@ -6,7 +6,10 @@
         qty=<availableQuantity of the product|missing>
         others=<"name: qty" of every other product with qty > 0, comma separated>
   parse.py items <file>
-      Reads resaleItems.json (one performance). Prints  count=<len(resaleItems)>
+      Reads resaleItems.json (one performance). Prints
+        count=<len(resaleItems)>
+        summary=<up to 4 items as "place category price", "; "-separated; tolerant
+                 of unknown field names, empty if nothing recognisable>
   parse.py titles <file>
       Reads ntfy.sh JSON-lines (topic/json?poll=1&since=...). Prints the title of
       every "message" event, one per line. Malformed lines are ignored.
@@ -50,9 +53,66 @@ def cmd_catalog(path, product_id, name_re):
     print("others=" + ", ".join(others))
 
 
+def _first(item, *keys):
+    """First scalar value found under any of the keys (dotted paths allowed)."""
+    for key in keys:
+        cur = item
+        for part in key.split("."):
+            cur = cur.get(part) if isinstance(cur, dict) else None
+            if cur is None:
+                break
+        if isinstance(cur, (str, int, float)) and str(cur).strip() != "":
+            return str(cur).strip()
+    return None
+
+
+def describe_item(item):
+    """Compact one-line description of one resale item, tolerant of unknown field
+    names: 'B7 r12 s5 Kategori 2 450' (place, category, price, 'xN' if several)."""
+    parts = []
+    place = _first(item, "seatPath", "seatDescription")
+    if place is None:
+        bits = []
+        area = _first(item, "area", "areaName", "section", "sectionName", "blockName", "block", "zone")
+        row = _first(item, "row", "rowName", "rowNumber")
+        seat = _first(item, "seat", "seatNumber", "seatName", "number")
+        if area:
+            bits.append(area)
+        if row:
+            bits.append("r" + row)
+        if seat:
+            bits.append("s" + seat)
+        place = " ".join(bits) or None
+    if place:
+        parts.append(place)
+    cat = _first(item, "seatCategory", "seatCategoryName", "seatCategory.name", "categoryName")
+    if cat:
+        parts.append(cat)
+    price = _first(item, "price", "unitAmount", "unitPrice", "amount", "priceWithCharge")
+    if price:
+        parts.append(price)
+    qty = _first(item, "availableQuantity", "quantity", "remainingQuantity")
+    if qty and qty not in ("1", "1.0"):
+        parts.append("x" + qty)
+    return " ".join(parts)
+
+
+def summarize_items(items, max_items=4, max_len=220):
+    descs = [d for d in (describe_item(i) for i in items if isinstance(i, dict)) if d]
+    shown = descs[:max_items]
+    if len(descs) > max_items:
+        shown.append("+%d more" % (len(descs) - max_items))
+    text = "; ".join(shown)
+    if len(text) > max_len:
+        text = text[: max_len - 3].rstrip() + "..."
+    return text
+
+
 def cmd_items(path):
     data = load_json(path)
-    print("count=%d" % len(data.get("resaleItems") or []))
+    items = data.get("resaleItems") or []
+    print("count=%d" % len(items))
+    print("summary=" + summarize_items(items))
 
 
 def cmd_shop(path, matches):

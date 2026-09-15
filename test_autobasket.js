@@ -1,0 +1,171 @@
+// Tests for the decision logic in autobasket.user.js.  Run:  node test_autobasket.js
+'use strict';
+const assert = require('assert');
+const fs = require('fs');
+const AB = require('./autobasket.user.js');
+
+let pass = 0, fail = 0;
+function t(name, fn) {
+  try { fn(); pass++; console.log('ok   - ' + name); }
+  catch (e) { fail++; console.log('FAIL - ' + name + '\n       ' + ((e && e.message) || e)); }
+}
+
+// Two plausible shapes of a resaleItems.json entry. The real one is confirmed from the
+// first live capture; the script must cope with both and refuse to send when it cannot.
+function siteItem(o) {   // SecuTix-style: ids + movementIds + seatPath
+  return Object.assign({
+    movementIds: [o.mid], seatCategoryId: o.cat || 501, audienceSubCategoryId: 901, price: o.price || 450,
+    seatPath: (o.area || 'B7') + ' / ' + (o.row || '12') + ' / ' + o.seat, availableQuantity: 1,
+    seatCategory: { id: o.cat || 501, name: 'Kategori 2' }
+  }, o.extra || {});
+}
+function fixtureItem(o) {  // shape of test-fixtures/items-hit.json (no ids for the request)
+  return { itemId: o.mid, seatCategory: 'Kategori 2', area: o.area || 'B7', row: o.row || '12', seat: String(o.seat), price: 450, priceWithCharge: 470, audienceSubCategory: 'Ordinær' };
+}
+const seatsFrom = (items) => AB.expandSeats(AB.normalizeItems({ resaleItems: items }));
+const nos = (choice) => choice.seats.map((s) => s.seatNo).sort((a, b) => a - b);
+
+console.log('# alert parsing');
+t('resale alert with counts', () => {
+  const a = AB.parseAlert({ event: 'message', title: 'TICKETS LISTED on NFF resale!', message: 'Denmark: 2 tickets [B7 r12 s5 Kategori 2 450; B7 r12 s6 Kategori 2 450]. Portugal: 0. Nations League total 2. Open resale.fotball.no now.' });
+  assert.deepStrictEqual(a, { kind: 'resale', counts: { Denmark: 2 } });
+});
+t('resale alert for both matches', () => {
+  const a = AB.parseAlert({ title: 'TICKETS LISTED on NFF resale!', message: 'Denmark: 4 tickets. Portugal: 1 tickets. Nations League total 5.' });
+  assert.deepStrictEqual(a.counts, { Denmark: 4, Portugal: 1 });
+});
+t('catalog-only alert has no counts (script then checks both matches)', () => {
+  const a = AB.parseAlert({ title: 'TICKETS LISTED on NFF resale!', message: 'Nations League resale shows 1 ticket(s) but none for Denmark or Portugal. Could be the 14 Nov match.' });
+  assert.strictEqual(a.kind, 'resale'); assert.deepStrictEqual(a.counts, {});
+});
+t('main shop alert', () => assert.strictEqual(AB.parseAlert({ title: 'TICKETS ON SALE at billett.fotball.no!', message: 'x' }).kind, 'shop'));
+t('heartbeat is ignored', () => assert.strictEqual(AB.parseAlert({ title: 'NFF resale watcher', message: 'Still watching.' }), null));
+t('our own pushes are ignored', () => assert.strictEqual(AB.parseAlert({ title: 'Auto-basket: RESERVED', message: 'x' }), null));
+t('non-message events are ignored', () => assert.strictEqual(AB.parseAlert({ event: 'keepalive' }), null));
+
+console.log('# place parsing');
+t('explicit area/row/seat fields', () => assert.deepStrictEqual(AB.parsePlace({ area: 'B7', row: '12', seat: '5' }), { area: 'B7', row: '12', seatNo: 5, seatLabel: '5' }));
+t('seatPath with slashes and words', () => {
+  const p = AB.parsePlace({ seatPath: 'Felt 107 / Rad 12 / Sete 5' });
+  assert.strictEqual(p.area, 'Felt 107'); assert.strictEqual(p.row, 'Rad 12'); assert.strictEqual(p.seatNo, 5);
+});
+t('seatPath with dashes and four segments', () => {
+  const p = AB.parsePlace({ seatPath: 'Nedre - 107 - 12 - 5' });
+  assert.strictEqual(p.area, 'Nedre 107'); assert.strictEqual(p.row, '12'); assert.strictEqual(p.seatNo, 5);
+});
+t('no place information gives nulls', () => assert.deepStrictEqual(AB.parsePlace({ price: 1 }), { area: null, row: null, seatNo: null, seatLabel: null }));
+
+console.log('# item normalisation');
+t('site-style item keeps ids, price, category name and movement ids', () => {
+  const it = AB.normalizeItems({ resaleItems: [siteItem({ mid: 77, seat: 5 })] })[0];
+  assert.deepStrictEqual(it.movementIds, [77]); assert.strictEqual(it.seatCategoryId, 501);
+  assert.strictEqual(it.audienceSubCategoryId, 901); assert.strictEqual(it.price, 450);
+  assert.strictEqual(it.category, 'Kategori 2'); assert.strictEqual(it.quantity, 1); assert.strictEqual(it.place.seatNo, 5);
+});
+t('fixture-style item falls back to itemId and has no request ids', () => {
+  const it = AB.normalizeItems({ resaleItems: [fixtureItem({ mid: 9001, seat: 5 })] })[0];
+  assert.deepStrictEqual(it.movementIds, [9001]); assert.strictEqual(it.seatCategoryId, undefined);
+  assert.strictEqual(it.category, 'Kategori 2'); assert.strictEqual(it.place.area, 'B7');
+});
+t('single movementId and nested seatCategory.id are accepted', () => {
+  const it = AB.normalizeItems({ resaleItems: [{ movementId: 5, seatCategory: { id: 3 }, audienceSubCategory: { id: 4 }, unitAmount: '700,00' }] })[0];
+  assert.deepStrictEqual(it.movementIds, [5]); assert.strictEqual(it.seatCategoryId, 3); assert.strictEqual(it.audienceSubCategoryId, 4); assert.strictEqual(it.price, 700);
+});
+t('empty and malformed input give no items', () => {
+  assert.deepStrictEqual(AB.normalizeItems({ resaleItems: [] }), []);
+  assert.deepStrictEqual(AB.normalizeItems(null), []);
+  assert.deepStrictEqual(AB.normalizeItems({ resaleItems: [null, 3] }), []);
+});
+
+console.log('# seat expansion');
+t('one ticket per line becomes one seat', () => assert.strictEqual(seatsFrom([siteItem({ mid: 1, seat: 5 }), siteItem({ mid: 2, seat: 6 })]).length, 2));
+t('several tickets behind one line without seat numbers are unverifiable', () => {
+  const s = seatsFrom([{ movementIds: [1, 2], availableQuantity: 2, seatCategoryId: 1, audienceSubCategoryId: 1, price: 1, seatPath: 'B7 / 12 / 5' }]);
+  assert.strictEqual(s.length, 2); assert.ok(s.every((x) => x.seatNo === null));
+});
+t('nested seats list is expanded with its own numbers', () => {
+  const s = seatsFrom([{ movementIds: [1, 2], seatCategoryId: 1, audienceSubCategoryId: 1, price: 1, area: 'B7', row: '12', seats: [{ movementId: 1, seat: 5 }, { movementId: 2, seat: 6 }] }]);
+  assert.deepStrictEqual(s.map((x) => [x.movementId, x.area, x.row, x.seatNo]), [[1, 'B7', '12', 5], [2, 'B7', '12', 6]]);
+});
+t('a line without any id yields no seat', () => assert.strictEqual(seatsFrom([{ price: 450, seatPath: 'B7 / 12 / 5' }]).length, 0));
+
+console.log('# pair selection: never 1 or 3, adjacent only');
+const S = (...seatNos) => seatsFrom(seatNos.map((n, i) => siteItem({ mid: 100 + i, seat: n })));
+t('nothing listed', () => assert.strictEqual(AB.choosePairs([]), null));
+t('one seat is never taken', () => assert.strictEqual(AB.choosePairs(S(5)), null));
+t('two adjacent seats give 2', () => { const c = AB.choosePairs(S(5, 6)); assert.strictEqual(c.count, 2); assert.deepStrictEqual(nos(c), [5, 6]); });
+t('two seats with a gap are not a pair', () => assert.strictEqual(AB.choosePairs(S(5, 7)), null));
+t('two seats in different rows are not a pair', () => {
+  assert.strictEqual(AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5, row: '12' }), siteItem({ mid: 2, seat: 6, row: '13' })])), null);
+});
+t('two seats in different sections with neighbouring numbers are not a pair', () => {
+  assert.strictEqual(AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5, area: 'B7' }), siteItem({ mid: 2, seat: 6, area: 'B8' })])), null);
+});
+t('three in a row give one pair (2), never 3', () => { const c = AB.choosePairs(S(5, 6, 7)); assert.strictEqual(c.count, 2); assert.deepStrictEqual(nos(c), [5, 6]); });
+t('four in a row give 4', () => { const c = AB.choosePairs(S(5, 6, 7, 8)); assert.strictEqual(c.count, 4); assert.deepStrictEqual(nos(c), [5, 6, 7, 8]); assert.strictEqual(c.pairs.length, 2); });
+t('two pairs in different places give 4', () => {
+  const c = AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5, area: 'B7' }), siteItem({ mid: 2, seat: 6, area: 'B7' }), siteItem({ mid: 3, seat: 20, area: 'C1', row: '3' }), siteItem({ mid: 4, seat: 21, area: 'C1', row: '3' })]));
+  assert.strictEqual(c.count, 4); assert.strictEqual(c.pairs.length, 2);
+});
+t('five seats: run of three plus a pair elsewhere give 4', () => {
+  const c = AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5 }), siteItem({ mid: 2, seat: 6 }), siteItem({ mid: 3, seat: 7 }), siteItem({ mid: 4, seat: 30, row: '2' }), siteItem({ mid: 5, seat: 31, row: '2' })]));
+  assert.strictEqual(c.count, 4); assert.deepStrictEqual(nos(c), [5, 6, 30, 31]);
+});
+t('six in a row give 4, not 6', () => { const c = AB.choosePairs(S(1, 2, 3, 4, 5, 6)); assert.strictEqual(c.count, 4); assert.deepStrictEqual(nos(c), [1, 2, 3, 4]); });
+t('four in a row are preferred over two separate pairs', () => {
+  const c = AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 1, area: 'A' }), siteItem({ mid: 2, seat: 2, area: 'A' }), siteItem({ mid: 3, seat: 10, area: 'B' }), siteItem({ mid: 4, seat: 11, area: 'B' }), siteItem({ mid: 5, seat: 12, area: 'B' }), siteItem({ mid: 6, seat: 13, area: 'B' })]));
+  assert.deepStrictEqual(c.seats.map((s) => s.area), ['B', 'B', 'B', 'B']);
+});
+t('unnumbered tickets are never taken', () => {
+  assert.strictEqual(AB.choosePairs(seatsFrom([{ movementIds: [1, 2, 3, 4], availableQuantity: 4, seatCategoryId: 1, audienceSubCategoryId: 1, price: 1 }])), null);
+});
+t('duplicate listing of the same seat does not form a pair with itself', () => assert.strictEqual(AB.choosePairs(S(5, 5)), null));
+t('a want list of [2] takes one pair even when four are there', () => assert.strictEqual(AB.choosePairs(S(5, 6, 7, 8), [2]).count, 2));
+t('excluded sections are skipped', () => {
+  const old = AB.EXCLUDE_AREA; AB.EXCLUDE_AREA = /^B7$/;
+  try { assert.strictEqual(AB.choosePairs(S(5, 6)), null); } finally { AB.EXCLUDE_AREA = old; }
+});
+
+console.log('# basket request');
+t('payload groups by tariff/category/price and lists exactly the chosen movement ids', () => {
+  const c = AB.choosePairs(S(5, 6, 7, 8));
+  const p = AB.buildPayload('10229739913106', c.seats);
+  assert.strictEqual(p.performanceId, 10229739913106);
+  assert.strictEqual(p.resaleItemData.length, 1);
+  assert.deepStrictEqual(p.resaleItemData[0], { audienceSubCategoryId: 901, seatCategoryId: 501, quantity: 4, unitAmount: 450, movementIds: [100, 101, 102, 103] });
+  assert.deepStrictEqual(AB.payloadMissing(p), []);
+});
+t('pairs with different prices become separate entries', () => {
+  const c = AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5 }), siteItem({ mid: 2, seat: 6 }), siteItem({ mid: 3, seat: 20, row: '3', price: 700, cat: 502 }), siteItem({ mid: 4, seat: 21, row: '3', price: 700, cat: 502 })]));
+  const p = AB.buildPayload(1, c.seats);
+  assert.strictEqual(p.resaleItemData.length, 2);
+  assert.deepStrictEqual(p.resaleItemData.map((d) => d.quantity), [2, 2]);
+});
+t('fixture-shaped listing is recognised as a pair but the request is reported incomplete, not sent', () => {
+  const raw = JSON.parse(fs.readFileSync(__dirname + '/test-fixtures/items-hit.json', 'utf8'));
+  const seats = AB.expandSeats(AB.normalizeItems(raw));
+  const c = AB.choosePairs(seats);
+  assert.strictEqual(c.count, 2);
+  const missing = AB.payloadMissing(AB.buildPayload(10229739913106, c.seats));
+  assert.deepStrictEqual(missing.sort(), ['audienceSubCategoryId', 'seatCategoryId']);
+});
+t('empty payload is incomplete', () => assert.deepStrictEqual(AB.payloadMissing({ performanceId: 1, resaleItemData: [] }), ['resaleItemData']));
+
+console.log('# texts');
+t('known statuses have plain wording', () => {
+  assert.strictEqual(AB.describeStatus('DENIED_BY_PKP'), 'the waiting room denied the request');
+  assert.strictEqual(AB.describeStatus('ERR_TOO_MANY_TICKETS', { available: 2 }), 'too many tickets for one order (max 2)');
+  assert.strictEqual(AB.describeStatus('HTTP 403'), 'the shop answered HTTP 403');
+});
+t('pair description names section, row, seats, category and price', () => {
+  const c = AB.choosePairs(S(5, 6));
+  assert.strictEqual(AB.describePairs(c.pairs), 'B7 row 12 seats 5-6 Kategori 2 450 kr');
+});
+t('seat description caps the list', () => {
+  const d = AB.describeSeats(S(1, 3, 5, 7, 9, 11, 13, 15));
+  assert.ok(d.endsWith('+2 more'), d);
+});
+t('match page link carries the performance id', () => assert.ok(AB.matchPage('10229739913107').indexOf('performanceId=10229739913107') > 0));
+
+console.log('\n' + pass + ' passed, ' + fail + ' failed');
+process.exit(fail ? 1 : 0);

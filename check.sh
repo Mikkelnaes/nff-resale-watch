@@ -22,7 +22,10 @@
 #   NTFY_TOPIC            ntfy.sh topic to publish to (required unless DRY_RUN=1)
 #   CATALOG_URL, ITEMS_URL_TEMPLATE ({id} placeholder), SHOP_URL
 #                         override the three URLs (end-to-end tests against fixtures)
-#   CATALOG_FILE, ITEMS_FILE_TEMPLATE ({id}), SHOP_FILE
+#   ITEM_PAGE_URL_TEMPLATE ({id}) per-match resale page, fetched only on a hit as evidence
+#   EVIDENCE_DIR          on a hit: raw items JSON, catalog and match page are copied here
+#                         (the workflow uploads it as an artifact); empty string disables
+#   CATALOG_FILE, ITEMS_FILE_TEMPLATE ({id}), SHOP_FILE, ITEM_PAGE_FILE_TEMPLATE ({id})
 #                         test hooks: read these files instead of fetching
 #   NOW_HOUR / NOW_MINUTE test hook: override the UTC clock
 #   PASSES / PASS_GAP     reads per run and seconds between them (default 2 / 30): the job
@@ -50,6 +53,8 @@ MATCHES=${MATCHES:-'10229739913106:Denmark 10229739913107:Portugal'}
 LIST_PAGE='https://resale.fotball.no/list/resaleProducts/?lang=en'
 SHOP_PAGE='https://billett.fotball.no/selection/event/date?productId=10229739619905&lang=en'
 match_page() { echo "https://resale.fotball.no/selection/resale/item?performanceId=$1&checkResaleAvailability=true"; }
+ITEM_PAGE_URL_TEMPLATE=${ITEM_PAGE_URL_TEMPLATE:-'https://resale.fotball.no/selection/resale/item?performanceId={id}&checkResaleAvailability=true&lang=en'}
+EVIDENCE_DIR=${EVIDENCE_DIR-evidence}      # relative to the repo dir (the workflow uploads it)
 UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) nff-resale-watch'
 ATTEMPTS=${ATTEMPTS:-2}
 RETRY_SLEEP=${RETRY_SLEEP:-5}
@@ -172,22 +177,25 @@ case $FETCH in
 esac
 
 # --- 2. per-match resale items ---------------------------------------------------
-counts_log=''; hit_lines=''; hit_click=''; items_err=''; heartbeat_resale=''
+counts_log=''; hit_lines=''; hit_click=''; hit_ids=''; items_err=''; heartbeat_resale=''
 for m in $MATCHES; do
   id=${m%%:*}; name=${m#*:}
   url=${ITEMS_URL_TEMPLATE//\{id\}/$id}
   hookfile=''; [ -n "${ITEMS_FILE_TEMPLATE:-}" ] && hookfile=$(hook "${ITEMS_FILE_TEMPLATE//\{id\}/$id}" "$pass")
   fetch "$url" "$work/items-$id.json" "$hookfile"
-  count=ERR
+  count=ERR; summary=''
   if [ "$FETCH" = OK ]; then
-    if c=$(parse items "$work/items-$id.json"); then count=${c#count=}; else items_err="$name items parse: $(parse_err)"; fi
+    if c=$(parse items "$work/items-$id.json"); then
+      count=$(sed -n 's/^count=//p' <<<"$c"); summary=$(sed -n 's/^summary=//p' <<<"$c")
+    else items_err="$name items parse: $(parse_err)"; fi
   elif [ "$FETCH" = QUEUE ]; then count=QUEUE
   else items_err="$name items: $FETCH_ERR"
   fi
   counts_log+="${name,,}=$count "
   heartbeat_resale+="$name $count, "
   if [[ "$count" =~ ^[0-9]+$ ]] && [ "$count" -gt 0 ]; then
-    hit_lines+="$name: $count tickets. "
+    hit_lines+="$name: $count tickets${summary:+ [$summary]}. "
+    hit_ids+="$id "
     [ -z "$hit_click" ] && hit_click=$(match_page "$id")
   else
     hit_lines+="$name: ${count/ERR/?}. "
@@ -266,6 +274,21 @@ if ! $urgent && $top_of_hour && [ "$pass" = 1 ]; then   # hourly notices / heart
   if ! $sent && [ "$hour" = "08" ]; then
     notify_once low 'NFF resale watcher' "$LIST_PAGE" "Still watching. Resale: Nations League $qty tickets ($heartbeat_resale). Shop: $heartbeat_shop."
   fi
+fi
+
+# --- evidence: only on a hit, and only after the alerts so it never delays them ----
+# The per-match page exists only while a listing is live; its HTML (init flags such
+# as withCaptcha) and the raw items JSON are what the auto-basket userscript is
+# built against. The workflow uploads EVIDENCE_DIR as an artifact.
+if [ -n "$hit_ids" ] && [ -n "$EVIDENCE_DIR" ]; then
+  mkdir -p "$EVIDENCE_DIR"
+  cp "$work/catalog.json" "$EVIDENCE_DIR/catalog-p$pass.json" 2>/dev/null
+  for id in $hit_ids; do
+    cp "$work/items-$id.json" "$EVIDENCE_DIR/items-$id-p$pass.json" 2>/dev/null
+    pagehook=''; [ -n "${ITEM_PAGE_FILE_TEMPLATE:-}" ] && pagehook=$(hook "${ITEM_PAGE_FILE_TEMPLATE//\{id\}/$id}" "$pass")
+    fetch "${ITEM_PAGE_URL_TEMPLATE//\{id\}/$id}" "$EVIDENCE_DIR/item-$id-p$pass.html" "$pagehook"
+    echo "  evidence: items-$id-p$pass.json saved, item page $FETCH${FETCH_ERR:+ ($FETCH_ERR)}"
+  done
 fi
 }
 

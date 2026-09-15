@@ -53,6 +53,63 @@ real error in the run log:
 
     2026-09-05T20:20:03Z resale=EMPTY qty=0 denmark=0 portugal=0 shop=SOLDOUT
 
+On a hit the alert lists what is on offer (section, row, seat, category, price, as
+far as the resale JSON exposes them), and after the alert has gone out the run saves
+the raw items JSON, the catalog and the per-match page HTML (which only exists while
+a listing is live) to `evidence/`, uploaded as the workflow artifact
+`evidence-<run id>` (14 days). The first real capture is what the userscript below
+is verified against.
+
+## Auto-basket userscript (reserves in your own browser)
+
+The basket on resale.fotball.no belongs to the browser session, not to the account
+(a basket made on the laptop is not visible after logging in on the phone), so the
+reservation has to happen in the browser you will pay from. `autobasket.user.js`
+does that. It does **not** poll the shop: it listens to the ntfy topic and acts when
+the cloud watcher's "TICKETS LISTED on NFF resale!" alert arrives.
+
+What it does on an alert, in the logged-in tab:
+
+1. reads the per-match items JSON for Denmark and Portugal once (the same request
+   the match page makes);
+2. picks seats: 4 if two adjacent pairs exist (four in a row preferred), else 2 if
+   one adjacent pair exists, never 1 or 3. Adjacent = same section, same row, seat
+   numbers 1 apart. Tickets without seat numbers are never taken;
+3. sends the shop's own add-to-basket request (`POST /ajax/selection/resale/item/submit`);
+4. on success: 20 s alarm, phone push "Auto-basket: RESERVED ... pay NOW", opens the
+   basket. You pay by hand within the hold (about 15 minutes);
+5. on anything else (waiting room, captcha, tickets gone, request format not
+   recognised): alarm, phone push with the reason, opens the match page so you are
+   one click away. It then pauses 3 minutes so it does not reload the page under you.
+
+Install (Chrome on the laptop):
+
+1. Install the Tampermonkey extension from the Chrome Web Store.
+2. Tampermonkey dashboard -> `+` (new script) -> replace the template with the
+   contents of `autobasket.user.js` -> Ctrl+S.
+3. Open <https://resale.fotball.no/list/resaleProducts/?lang=en> and log in. A black
+   box appears bottom-right. It asks for the ntfy topic (the same value as the
+   `NTFY_TOPIC` secret); it is stored in the browser only.
+4. Click **Arm audio / test alarm** once (browsers only allow sound after a click);
+   allow desktop notifications if asked. The box must say `ARMED`, `ntfy: connected`,
+   `this tab: active`, `login: yes`.
+5. Leave the laptop on and awake (disable sleep), the tab open in its own window
+   (not minimised). Keep one such tab; a second tab shows `standby`.
+
+Dry run: **Switch to dry run** makes it push "would reserve ..." and open the match
+page instead of reserving. **Reset** clears the cooldown after a reservation or the
+pause after a failure. A keepalive request every 10 minutes keeps the login alive
+(turn off with **Keepalive off**).
+
+Assumptions and limits: seat numbers are taken as consecutive along a row (if
+Ullevaal numbers odd/even from the aisle, set `ADJACENT_STEP` to 2); the field names
+in the resale JSON are matched against several candidates until the first live
+capture confirms them, and if the request cannot be built completely the script
+opens the match page instead of sending a guess. The shop sits behind DataDome, AWS
+WAF and a SecuTix waiting room; the script uses your real browser session and stops
+with an alarm if any of them intervenes. Nothing bypasses a captcha. NFF's terms
+forbid automated purchasing and allow cancelling such tickets; that risk is yours.
+
 ## Setup
 
 1. Install the ntfy app (Android/iOS) and subscribe to your topic name.
@@ -100,10 +157,14 @@ Expect two urgent pushes: "TICKETS LISTED on NFF resale!" (Denmark: 2 tickets) a
 
 ## Tests
 
-`bash test_check.sh` (needs `python3` or `python`; no other dependencies).
+`bash test_check.sh` (needs `python3` or `python`; no other dependencies) and
+`node test_autobasket.js` (the userscript's decision logic: alert parsing, item
+normalisation, pair selection, request building).
 Fixtures in `test-fixtures/` are real captures from 5 Sep 2026 (`*-empty.json`,
 `shop-soldout.html`, `waiting-room.html`) plus synthetic non-empty variants
-built on the field semantics used by the site's own JavaScript.
+built on the field semantics used by the site's own JavaScript
+(`item-page-hit.html` stands in for the per-match page, which is a 404 while
+nothing is listed).
 
 ## Stop
 
