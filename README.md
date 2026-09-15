@@ -76,8 +76,9 @@ What it does on an alert, in the logged-in tab:
    one adjacent pair exists, never 1 or 3. Adjacent = same section, same row, seat
    numbers 1 apart. Tickets without seat numbers are never taken;
 3. sends the shop's own add-to-basket request (`POST /ajax/selection/resale/item/submit`);
-4. on success: 20 s alarm, phone push "Auto-basket: RESERVED ... pay NOW", opens the
-   basket. You pay by hand within the hold (about 15 minutes);
+4. on success: a short quiet beep (2 s, `ALARM_SECONDS` / `ALARM_GAIN` in the script),
+   the tab title flashes for 10 s, phone push "Auto-basket: RESERVED ... pay NOW", opens
+   the basket. You pay by hand within the hold (about 15 minutes);
 5. on anything else (waiting room, captcha, tickets gone, request format not
    recognised): alarm, phone push with the reason, opens the match page so you are
    one click away. It then pauses 3 minutes so it does not reload the page under you.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.1.0
+// @version      0.1.1
 // @description  When the nff-resale-watch cloud watcher reports Norway-Denmark / Norway-Portugal resale tickets, reserve adjacent seats in this browser's basket and raise the alarm.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -30,7 +30,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.1.0',
+    VERSION: '0.1.1',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours
@@ -39,6 +39,9 @@
     PAUSE_MS: 3 * 60 * 1000,      // after a failure: leave the page alone while you work by hand
     STALE_MS: 2 * 60 * 1000,      // alerts older than this are ignored
     KEEPALIVE_MS: 10 * 60 * 1000, // one light request so the login does not time out (not listing polling)
+    ALARM_SECONDS: 2,             // short beep sequence
+    ALARM_GAIN: 0.08,             // quiet (0..1)
+    FLASH_SECONDS: 10,            // tab title flashes this long (silent)
     ALERT_TITLE_RESALE: 'TICKETS LISTED on NFF resale!',
     ALERT_TITLE_SHOP: 'TICKETS ON SALE at billett.fotball.no!',
     OWN_TITLE_PREFIX: 'Auto-basket',
@@ -335,14 +338,14 @@
     render();
   }
 
-  // alarm: 20 s of beeps, flashing title, desktop notification
+  // alarm: a short, quiet beep sequence (ALARM_SECONDS at ALARM_GAIN), flashing tab title, desktop notification
   function ensureAudio() {
     if (state.audio) return state.audio;
     try { state.audio = new (win.AudioContext || win.webkitAudioContext)(); } catch (e) { log('no audio: ' + e); }
     return state.audio;
   }
   function alarm(seconds) {
-    seconds = seconds || 20;
+    seconds = seconds || AB.ALARM_SECONDS;
     var ctx = ensureAudio();
     if (ctx) {
       try {
@@ -350,14 +353,14 @@
         var t0 = ctx.currentTime;
         for (var i = 0; i < seconds * 2; i++) {
           var o = ctx.createOscillator(), g = ctx.createGain();
-          o.type = 'square'; o.frequency.value = i % 2 ? 880 : 1320; g.gain.value = 0.25;
+          o.type = 'sine'; o.frequency.value = i % 2 ? 880 : 1320; g.gain.value = AB.ALARM_GAIN;
           o.connect(g); g.connect(ctx.destination); o.start(t0 + i * 0.5); o.stop(t0 + i * 0.5 + 0.3);
         }
       } catch (e) { log('audio failed: ' + e); }
     }
-    var orig = doc.title, n = 0;
+    var orig = doc.title, n = 0, flashes = AB.FLASH_SECONDS * 2;
     if (state.flashTimer) win.clearInterval(state.flashTimer);
-    state.flashTimer = win.setInterval(function () { doc.title = (n++ % 2 ? '!!! TICKETS !!! ' : '>>> TICKETS <<< ') + orig; if (n > seconds * 2) { win.clearInterval(state.flashTimer); doc.title = orig; } }, 500);
+    state.flashTimer = win.setInterval(function () { doc.title = (n++ % 2 ? '!!! TICKETS !!! ' : '>>> TICKETS <<< ') + orig; if (n > flashes) { win.clearInterval(state.flashTimer); doc.title = orig; } }, 500);
     try { if (win.Notification && win.Notification.permission === 'granted') new win.Notification('NFF auto-basket', { body: state.lastAction, requireInteraction: true }); } catch (e) { /* ignore */ }
   }
 
