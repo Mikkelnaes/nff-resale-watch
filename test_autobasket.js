@@ -22,6 +22,11 @@ function siteItem(o) {   // SecuTix-style: ids + movementIds + seatPath
 function fixtureItem(o) {  // shape of test-fixtures/items-hit.json (no ids for the request)
   return { itemId: o.mid, seatCategory: 'Kategori 2', area: o.area || 'B7', row: o.row || '12', seat: String(o.seat), price: 450, priceWithCharge: 470, audienceSubCategory: 'Ordinær' };
 }
+function liveItem(o) {  // real 15 Sep capture shape: block + remark "row - seat", price null, realPrice in thousandths
+  return { seatCatName: 'Category 3', seatArea: 'KIWI-Bama-svingen', block: o.block || '124', seatCategoryId: 10229721164074,
+    audienceSubCategory: 'Adult', quantity: 1, price: null, priceWithCharge: 690000, realPrice: 690000,
+    remark: (o.row || '5') + ' - ' + o.seat, itemId: o.mid, audienceSubCategoryId: 10229708951675, movementIds: [o.mid], resaleSeats: [] };
+}
 const seatsFrom = (items) => AB.expandSeats(AB.normalizeItems({ resaleItems: items }));
 const nos = (choice) => choice.seats.map((s) => s.seatNo).sort((a, b) => a - b);
 
@@ -71,6 +76,32 @@ t('single movementId and nested seatCategory.id are accepted', () => {
   const it = AB.normalizeItems({ resaleItems: [{ movementId: 5, seatCategory: { id: 3 }, audienceSubCategory: { id: 4 }, unitAmount: '700,00' }] })[0];
   assert.deepStrictEqual(it.movementIds, [5]); assert.strictEqual(it.seatCategoryId, 3); assert.strictEqual(it.audienceSubCategoryId, 4); assert.strictEqual(it.price, 700);
 });
+t('real 15 Sep capture: block as area, remark parsed to row/seat, price from realPrice, ids present', () => {
+  const it = AB.normalizeItems({ resaleItems: [liveItem({ mid: 10229785519841, row: '5', seat: '844' })] })[0];
+  assert.strictEqual(it.place.area, '124');
+  assert.strictEqual(it.place.row, '5');
+  assert.strictEqual(it.place.seatNo, 844);
+  assert.strictEqual(it.category, 'Category 3');
+  assert.strictEqual(it.price, 690000);
+  assert.deepStrictEqual(it.movementIds, [10229785519841]);
+  assert.strictEqual(it.seatCategoryId, 10229721164074);
+  assert.strictEqual(it.audienceSubCategoryId, 10229708951675);
+});
+t('two real-shape tickets in the same row form a complete, sendable pair', () => {
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 1, row: '5', seat: '844' }), liveItem({ mid: 2, row: '5', seat: '845' })] }));
+  const c = AB.choosePairs(seats);
+  assert.strictEqual(c.count, 2);
+  assert.deepStrictEqual(nos(c), [844, 845]);
+  const p = AB.buildPayload(10229739913106, c.seats);
+  assert.deepStrictEqual(AB.payloadMissing(p), []);
+  assert.strictEqual(p.resaleItemData[0].unitAmount, 690000);
+  assert.deepStrictEqual(p.resaleItemData[0].movementIds, [1, 2]);
+});
+t('real-shape seats one apart in different rows are not a pair', () => {
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 1, row: '5', seat: '844' }), liveItem({ mid: 2, row: '6', seat: '845' })] }));
+  assert.strictEqual(AB.choosePairs(seats), null);
+});
+t('price displays in kroner (thousandths divided)', () => assert.strictEqual(AB.kr(690000), 690));
 t('empty and malformed input give no items', () => {
   assert.deepStrictEqual(AB.normalizeItems({ resaleItems: [] }), []);
   assert.deepStrictEqual(AB.normalizeItems(null), []);
@@ -150,6 +181,27 @@ t('fixture-shaped listing is recognised as a pair but the request is reported in
   assert.deepStrictEqual(missing.sort(), ['audienceSubCategoryId', 'seatCategoryId']);
 });
 t('empty payload is incomplete', () => assert.deepStrictEqual(AB.payloadMissing({ performanceId: 1, resaleItemData: [] }), ['resaleItemData']));
+t('form body mirrors the match page fields and carries the csrf', () => {
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 111, row: '5', seat: '844' }), liveItem({ mid: 112, row: '5', seat: '845' })] }));
+  const body = AB.buildFormBody(AB.buildPayload(10229739913106, AB.choosePairs(seats).seats), 'tok-123');
+  assert.ok(body.indexOf('performanceId=10229739913106') === 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.audienceSubCategoryId=10229708951675') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.seatCategoryId=10229721164074') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.quantity=2') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.unitAmount=690000') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.movementIds%5B0%5D=111') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.movementIds%5B1%5D=112') > 0, body);
+  assert.ok(body.endsWith('_csrf=tok-123'), body);
+});
+t('two different-priced pairs make two form entries', () => {
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [
+    liveItem({ mid: 1, row: '5', seat: '10' }), liveItem({ mid: 2, row: '5', seat: '11' }),
+    Object.assign(liveItem({ mid: 3, row: '9', seat: '20' }), { realPrice: 990000, priceWithCharge: 990000, seatCategoryId: 55 }),
+    Object.assign(liveItem({ mid: 4, row: '9', seat: '21' }), { realPrice: 990000, priceWithCharge: 990000, seatCategoryId: 55 })] }));
+  const body = AB.buildFormBody(AB.buildPayload(1, AB.choosePairs(seats).seats), 'x');
+  assert.ok(body.indexOf('resaleItemData%5B1%5D.unitAmount=990000') > 0, body);
+});
+t('SHOP_ERROR (the error page the user hit) has plain wording', () => assert.ok(AB.describeStatus('SHOP_ERROR').indexOf('generic error page') > 0));
 
 console.log('# texts');
 t('known statuses have plain wording', () => {
@@ -160,6 +212,10 @@ t('known statuses have plain wording', () => {
 t('pair description names section, row, seats, category and price', () => {
   const c = AB.choosePairs(S(5, 6));
   assert.strictEqual(AB.describePairs(c.pairs), 'B7 row 12 seats 5-6 Kategori 2 450 kr');
+});
+t('pair description shows kroner for a real thousandths price', () => {
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 1, row: '5', seat: '844' }), liveItem({ mid: 2, row: '5', seat: '845' })] }));
+  assert.strictEqual(AB.describePairs(AB.choosePairs(seats).pairs), '124 row 5 seats 844-845 Category 3 690 kr');
 });
 t('seat description caps the list', () => {
   const d = AB.describeSeats(S(1, 3, 5, 7, 9, 11, 13, 15));

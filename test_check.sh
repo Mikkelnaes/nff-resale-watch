@@ -197,7 +197,7 @@ echo "# seat details in the alert and evidence capture on a hit (feeds the auto-
 run $H $IH $IE $SS 14 30
 assert_contains       "hit alert lists section, row and seat" "B7 r12 s5"
 assert_contains       "hit alert lists the seat category" "Kategori 2"
-assert_contains       "hit alert lists the price" "450"
+assert_contains       "hit alert lists the price" "470kr"
 assert_contains       "hit alert keeps the machine-readable count first" "Denmark: 2 tickets"
 assert_file           "hit saves the Denmark items JSON as evidence" "$tmp/evidence/items-$DK-p1.json"
 assert_file           "hit saves the Denmark match page as evidence" "$tmp/evidence/item-$DK-p1.html"

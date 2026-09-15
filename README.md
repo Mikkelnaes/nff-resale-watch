@@ -102,14 +102,29 @@ page instead of reserving. **Reset** clears the cooldown after a reservation or 
 pause after a failure. A keepalive request every 10 minutes keeps the login alive
 (turn off with **Keepalive off**).
 
+What the 15 Sep 2026 live capture confirmed (evidence artifact): the resale item
+JSON gives the section in `block` (e.g. `124`) and row+seat in `remark` (`"5 - 844"`
+= row 5, seat 844), not in dedicated fields; the ticket ids for the request are in
+`movementIds`, with `seatCategoryId` and `audienceSubCategoryId`; prices are in
+thousandths of a krone (`realPrice` 690000 = 690 kr, `price` is null). The match page
+is the seat-map variant whose form posts `performanceId` +
+`resaleItemData[i].{audienceSubCategoryId,seatCategoryId,quantity,unitAmount,movementIds[j]}`
+to `/selection/resale/item/submit` with a Spring `_csrf` token, and it loads **no
+captcha**. The script therefore fetches that page for a fresh `_csrf`, sends the
+urlencoded form (falling back to the cached-mode ajax endpoint), and treats a redirect
+into the cart or a `status:"OK"` as reserved.
+
 Assumptions and limits: seat numbers are taken as consecutive along a row (if
-Ullevaal numbers odd/even from the aisle, set `ADJACENT_STEP` to 2); the field names
-in the resale JSON are matched against several candidates until the first live
-capture confirms them, and if the request cannot be built completely the script
-opens the match page instead of sending a guess. The shop sits behind DataDome, AWS
-WAF and a SecuTix waiting room; the script uses your real browser session and stops
-with an alarm if any of them intervenes. Nothing bypasses a captcha. NFF's terms
-forbid automated purchasing and allow cancelling such tickets; that risk is yours.
+Ullevaal numbers odd/even from the aisle, set `ADJACENT_STEP` to 2). If the listing
+ever lacks the ids needed for the request, the script opens the match page instead of
+sending a guess. The shop sits behind DataDome, AWS WAF and a SecuTix waiting room;
+the script uses your real browser session and stops with an alarm if any of them
+intervenes (including the "Vi kan dessverre ikke behandle" error page you saw when
+buying by hand). Only 1-2 tickets have appeared so far and each was gone within about
+90 s; a single ticket is never reserved by design. The reservation POST could not be
+exercised against a live 2-ticket listing yet, so the first armed pair is also the
+first proof: watch the overlay and the evidence artifact. NFF's terms forbid automated
+purchasing and allow cancelling such tickets; that risk is yours.
 
 ## Setup
 

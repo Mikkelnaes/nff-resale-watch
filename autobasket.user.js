@@ -45,7 +45,8 @@
     ALERT_TITLE_RESALE: 'TICKETS LISTED on NFF resale!',
     ALERT_TITLE_SHOP: 'TICKETS ON SALE at billett.fotball.no!',
     OWN_TITLE_PREFIX: 'Auto-basket',
-    SUBMIT_PATH: '/ajax/selection/resale/item/submit',
+    SUBMIT_PATH: '/ajax/selection/resale/item/submit',   // cached-mode ajax variant
+    FORM_SUBMIT_PATH: '/selection/resale/item/submit',    // the form action on the real match page (15 Sep)
     ITEMS_PATH: '/selection/resale/resaleItems.json',
     BASKET_PATH: '/cart/shoppingCart?lang=en',
     KEEPALIVE_PATH: '/cartData.json?lang=en',
@@ -89,10 +90,22 @@
   // ---- item normalisation --------------------------------------------------------
   // The real field names of resaleItems.json are confirmed from the first live capture
   // (evidence artifact); until then several candidates are accepted for every field.
+  // Real 15 Sep capture: seat location is not in dedicated fields; the section is
+  // `block` ("124") / `seatArea` ("KIWI-Bama-svingen") and row+seat are in
+  // `remark` ("5 - 844" = row 5, seat 844). Explicit fields and a seatPath are still
+  // accepted first so synthetic fixtures and any future shape keep working.
   AB.parsePlace = function (item) {
-    var area = pick(item, ['area', 'areaName', 'section', 'sectionName', 'blockName', 'block', 'zone', 'zoneName', 'area.name']);
+    var area = pick(item, ['block', 'seatArea', 'area', 'areaName', 'section', 'sectionName', 'blockName', 'zone', 'zoneName', 'area.name']);
     var row = pick(item, ['row', 'rowName', 'rowNumber', 'rowLabel', 'row.name']);
     var seat = pick(item, ['seat', 'seatNumber', 'seatName', 'seatLabel', 'number', 'seat.number']);
+    if (row === undefined || seat === undefined) {
+      var remark = pick(item, ['remark']);
+      if (typeof remark === 'string' && remark.indexOf('-') >= 0) {
+        var rs = remark.split('-');
+        if (row === undefined) row = rs[0].trim();
+        if (seat === undefined) seat = rs.slice(1).join('-').trim();
+      }
+    }
     if (area === undefined || row === undefined || seat === undefined) {
       var path = pick(item, ['seatPath', 'seatDescription', 'seatLabelPath', 'placeDescription']);
       if (typeof path === 'string') {
@@ -124,13 +137,16 @@
       }
       var qty = num(pick(it, ['availableQuantity', 'quantity', 'remainingQuantity']));
       if (qty === null) qty = mids.length || 1;
-      var cat = pick(it, ['seatCategory', 'seatCategoryName', 'categoryName']);
+      var cat = pick(it, ['seatCatName', 'seatCategoryName', 'seatCategory', 'categoryName']);
       if (cat && typeof cat === 'object') cat = pick(cat, ['name', 'label']);
+      // `price` is null on real listings; realPrice/priceWithCharge carry the amount.
+      // Kept in NFF's own units (thousandths of a krone) so it round-trips into the
+      // basket request unchanged; only the display divides by 1000.
       return {
         movementIds: mids,
         seatCategoryId: pick(it, ['seatCategoryId', 'seatCategory.id', 'seatCatId', 'categoryId']),
         audienceSubCategoryId: pick(it, ['audienceSubCategoryId', 'audienceSubCategory.id', 'audSubCatId', 'tariffId']),
-        price: num(pick(it, ['price', 'unitAmount', 'unitPrice', 'amount'])),
+        price: num(pick(it, ['realPrice', 'priceWithCharge', 'price', 'unitAmount', 'unitPrice', 'amount'])),
         category: str(cat),
         quantity: qty,
         place: AB.parsePlace(it),
@@ -233,6 +249,26 @@
     return Object.keys(missing);
   };
 
+  // The real match page (15 Sep capture) is the seat-map variant: a plain form
+  // <form id="ResaleItemFormModel" action="/selection/resale/item/submit" method="post">
+  // with a Spring _csrf hidden input, into which its JS injects
+  // resaleItemData[i].{audienceSubCategoryId,seatCategoryId,quantity,unitAmount,movementIds[j]}.
+  // buildFormBody produces exactly that urlencoded body so the request is byte-for-byte
+  // what clicking the page's own button sends.
+  AB.buildFormBody = function (payload, csrf) {
+    var parts = [['performanceId', payload.performanceId]];
+    (payload.resaleItemData || []).forEach(function (d, i) {
+      var p = 'resaleItemData[' + i + '].';
+      parts.push([p + 'audienceSubCategoryId', d.audienceSubCategoryId]);
+      parts.push([p + 'seatCategoryId', d.seatCategoryId]);
+      parts.push([p + 'quantity', d.quantity]);
+      parts.push([p + 'unitAmount', d.unitAmount]);
+      (d.movementIds || []).forEach(function (mid, j) { parts.push([p + 'movementIds[' + j + ']', mid]); });
+    });
+    if (csrf) parts.push(['_csrf', csrf]);
+    return parts.map(function (kv) { return encodeURIComponent(kv[0]) + '=' + encodeURIComponent(kv[1] === undefined || kv[1] === null ? '' : kv[1]); }).join('&');
+  };
+
   AB.STATUS_TEXT = {
     OK: 'reserved',
     DENIED_BY_PKP: 'the waiting room denied the request',
@@ -240,7 +276,8 @@
     ERR_ALREADY_FULL: 'the tickets were already taken',
     ERR_SALE_RESTRICTION: 'a sale restriction applies to this listing',
     ERR_NO_PERFORMANCE_AVAILABILITY: 'no availability for this match any more',
-    ERR_NO_AVAILABLE_SEAT_CATEGORIES: 'no available seat categories'
+    ERR_NO_AVAILABLE_SEAT_CATEGORIES: 'no available seat categories',
+    SHOP_ERROR: 'the shop returned its generic error page (busy or the ticket was taken)'
   };
   AB.describeStatus = function (status, params) {
     var t = AB.STATUS_TEXT[status] || ('the shop answered ' + status);
@@ -248,16 +285,21 @@
     return t;
   };
 
+  AB.kr = function (price) {   // NFF states amounts in thousandths of a krone (690000 = 690 kr)
+    if (price === null || price === undefined) return null;
+    return Math.round(price >= 100000 ? price / 1000 : price);
+  };
   AB.describePairs = function (pairs) {
     return pairs.map(function (p) {
-      var a = p[0], b = p[1], it = a.item;
-      return a.area + ' row ' + a.row + ' seats ' + a.seatNo + '-' + b.seatNo + (it.category ? ' ' + it.category : '') + (it.price !== null ? ' ' + it.price + ' kr' : '');
+      var a = p[0], b = p[1], it = a.item, kr = AB.kr(it.price);
+      return a.area + ' row ' + a.row + ' seats ' + a.seatNo + '-' + b.seatNo + (it.category ? ' ' + it.category : '') + (kr !== null ? ' ' + kr + ' kr' : '');
     }).join('; ');
   };
   AB.describeSeats = function (seats, max) {
     max = max || 6;
     var d = seats.map(function (s) {
-      return (s.area || '?') + ' r' + (s.row || '?') + ' s' + (s.seatNo === null ? '?' : s.seatNo) + (s.item.price !== null ? ' ' + s.item.price : '');
+      var kr = AB.kr(s.item.price);
+      return (s.area || '?') + ' r' + (s.row || '?') + ' s' + (s.seatNo === null ? '?' : s.seatNo) + (kr !== null ? ' ' + kr : '');
     });
     return d.slice(0, max).join('; ') + (d.length > max ? ' +' + (d.length - max) + ' more' : '');
   };
@@ -383,27 +425,52 @@
         });
       });
   }
-  function findCsrf() {
-    var mt = doc.querySelector('meta[name="_csrf"]'), mh = doc.querySelector('meta[name="_csrf_header"]');
-    if (mt && mt.content) return { header: (mh && mh.content) || 'X-CSRF-TOKEN', token: mt.content };
-    var inp = doc.querySelector('input[name="_csrf"]');
-    if (inp && inp.value) return { header: 'X-CSRF-TOKEN', token: inp.value };
-    var m = /(?:^|;\s*)XSRF-TOKEN=([^;]+)/.exec(doc.cookie);
-    if (m) return { header: 'X-XSRF-TOKEN', token: decodeURIComponent(m[1]) };
-    return null;
+  // The match page carries the Spring _csrf token this session needs to POST. It is
+  // fetched fresh (the script runs on the list page, which has no such token) and its
+  // presence also proves the listing is still live and not behind the waiting room.
+  function fetchItemPage(id) {
+    return win.fetch(AB.matchPage(id), { credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+      .then(function (r) { return r.text().then(function (t) { return { ok: r.ok, url: r.url, html: t }; }); });
   }
-  function submit(payload) {
+  function csrfFrom(html) {
+    var m = /name="_csrf"\s+value="([^"]+)"/.exec(html) || /name="_csrf"\s+content="([^"]+)"/.exec(html);
+    return m ? m[1] : null;
+  }
+  function readAjaxAnswer(r, t) {
+    var j = null; try { j = JSON.parse(t); } catch (e) { j = null; }
+    if (j && j.status) return j;
+    if (/Waiting Room/i.test(t) || /pkpcontroller/.test(r.url)) return { status: 'DENIED_BY_PKP' };
+    return null;   // not a recognised structured answer
+  }
+  // Reserve. Primary path mirrors the captured page exactly: urlencoded form POST to
+  // /selection/resale/item/submit with the page's _csrf; success is a redirect into the
+  // cart. If that endpoint is not the active one, the cached-mode ajax JSON endpoint is
+  // tried. Either way a structured OK or a cart redirect => reserved.
+  function submit(payload, csrf) {
+    var body = AB.buildFormBody(payload, csrf);
+    return win.fetch(AB.FORM_SUBMIT_PATH, {
+      method: 'POST', credentials: 'same-origin', redirect: 'follow',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body: body
+    }).then(function (r) {
+      return r.text().then(function (t) {
+        var j = readAjaxAnswer(r, t); if (j) return j;
+        if (/pkpcontroller|Waiting Room/i.test(r.url + t)) return { status: 'DENIED_BY_PKP' };
+        if (/\/(cart|shoppingCart)/i.test(r.url) && !/error/i.test(r.url)) return { status: 'OK', parameters: { redirect: AB.BASKET_PATH } };
+        if (/(dessverre ikke behandle|Feil<|error-page|errorPage)/i.test(t)) return { status: 'SHOP_ERROR' };
+        return tryAjax(payload, csrf);   // form endpoint inconclusive: try the ajax one
+      });
+    }, function () { return tryAjax(payload, csrf); });
+  }
+  function tryAjax(payload, csrf) {
     var headers = { 'Content-Type': 'application/json', 'Accept': 'application/json, text/javascript, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest' };
-    var csrf = findCsrf(); if (csrf) headers[csrf.header] = csrf.token;
+    if (csrf) { headers['X-CSRF-TOKEN'] = csrf; headers['X-XSRF-TOKEN'] = csrf; }
     return win.fetch(AB.SUBMIT_PATH, { method: 'POST', credentials: 'same-origin', headers: headers, body: JSON.stringify(payload) })
       .then(function (r) {
         return r.text().then(function (t) {
-          var j = null; try { j = JSON.parse(t); } catch (e) { j = null; }
-          if (j && j.status) return j;
-          if (/Waiting Room/i.test(t) || /pkpcontroller/.test(r.url)) return { status: 'DENIED_BY_PKP' };
-          return { status: 'HTTP ' + r.status + (j ? '' : ', non-JSON answer') };
+          var j = readAjaxAnswer(r, t); if (j) return j;
+          return { status: 'HTTP ' + r.status + ', unrecognised answer' };
         });
-      });
+      }, function (e) { return { status: 'request failed: ' + e }; });
   }
 
   // one match: read listing -> choose -> reserve. Resolves {id, outcome, redirect?}
@@ -432,12 +499,16 @@
         return push('urgent', AB.OWN_TITLE_PREFIX + ' dry run', t2 + ' Match page opened on the laptop.', page).then(function () { return { id: id, outcome: 'dryrun' }; });
       }
       setAction('reserving ' + desc);
-      return submit(payload).then(function (res) {
-        if (res.status === 'ERR_TOO_MANY_TICKETS' && choice.count === 4) {   // shop caps the order: fall back to one pair
-          var two = AB.choosePairs(seats, [2]);
-          if (two) { desc = '2 x ' + name + ' (' + AB.describePairs(two.pairs) + ')'; setAction('retrying with ' + desc); return submit(AB.buildPayload(id, two.seats)); }
-        }
-        return res;
+      return fetchItemPage(id).then(function (pg) {   // fresh _csrf; also confirms the listing is still live
+        var csrf = csrfFrom(pg.html);
+        if (/pkpcontroller/.test(pg.url) || /Waiting Room/i.test(pg.html)) return { status: 'DENIED_BY_PKP' };
+        return submit(payload, csrf).then(function (res) {
+          if (res.status === 'ERR_TOO_MANY_TICKETS' && choice.count === 4) {   // shop caps the order: fall back to one pair
+            var two = AB.choosePairs(seats, [2]);
+            if (two) { desc = '2 x ' + name + ' (' + AB.describePairs(two.pairs) + ')'; setAction('retrying with ' + desc); return submit(AB.buildPayload(id, two.seats), csrf); }
+          }
+          return res;
+        });
       }).then(function (res) {
         if (res.status === 'OK') {
           var t3 = 'RESERVED ' + desc + '. Pay NOW on the laptop, the basket hold is about 15 minutes.';

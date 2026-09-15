@@ -66,16 +66,47 @@ def _first(item, *keys):
     return None
 
 
+def _row_seat(item):
+    """(row, seat) from explicit fields, else NFF's `remark` ("row - seat", e.g.
+    "5 - 844" seen in the 15 Sep capture). Either may be None."""
+    row = _first(item, "row", "rowName", "rowNumber")
+    seat = _first(item, "seat", "seatNumber", "seatName", "number")
+    if row is None or seat is None:
+        remark = _first(item, "remark")
+        if remark and "-" in remark:
+            a, b = (p.strip() for p in remark.split("-", 1))
+            if row is None:
+                row = a or None
+            if seat is None:
+                seat = b or None
+    return row, seat
+
+
+def _price_nok(item):
+    """Face price as an integer number of kroner. NFF states amounts in thousandths
+    (690000 = 690 kr); `price` is null on real listings, `realPrice`/`priceWithCharge`
+    carry it."""
+    raw = _first(item, "realPrice", "priceWithCharge", "price", "unitAmount", "amount")
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+    except ValueError:
+        return None
+    if val >= 100000:            # thousandths of a krone
+        val /= 1000.0
+    return str(int(round(val)))
+
+
 def describe_item(item):
-    """Compact one-line description of one resale item, tolerant of unknown field
-    names: 'B7 r12 s5 Kategori 2 450' (place, category, price, 'xN' if several)."""
+    """Compact one-line description of one resale item, tolerant of field-name
+    variants: 'block 124 r5 s844 Category 3 690kr' (place, category, price)."""
     parts = []
     place = _first(item, "seatPath", "seatDescription")
     if place is None:
         bits = []
-        area = _first(item, "area", "areaName", "section", "sectionName", "blockName", "block", "zone")
-        row = _first(item, "row", "rowName", "rowNumber")
-        seat = _first(item, "seat", "seatNumber", "seatName", "number")
+        area = _first(item, "block", "seatArea", "area", "areaName", "section", "sectionName", "blockName", "zone")
+        row, seat = _row_seat(item)
         if area:
             bits.append(area)
         if row:
@@ -85,12 +116,12 @@ def describe_item(item):
         place = " ".join(bits) or None
     if place:
         parts.append(place)
-    cat = _first(item, "seatCategory", "seatCategoryName", "seatCategory.name", "categoryName")
+    cat = _first(item, "seatCatName", "seatCategoryName", "seatCategory", "seatCategory.name", "categoryName")
     if cat:
         parts.append(cat)
-    price = _first(item, "price", "unitAmount", "unitPrice", "amount", "priceWithCharge")
+    price = _price_nok(item)
     if price:
-        parts.append(price)
+        parts.append(price + "kr")
     qty = _first(item, "availableQuantity", "quantity", "remainingQuantity")
     if qty and qty not in ("1", "1.0"):
         parts.append("x" + qty)
