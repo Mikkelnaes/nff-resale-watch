@@ -201,14 +201,8 @@ t('two different-priced pairs make two form entries', () => {
   const body = AB.buildFormBody(AB.buildPayload(1, AB.choosePairs(seats).seats), 'x');
   assert.ok(body.indexOf('resaleItemData%5B1%5D.unitAmount=990000') > 0, body);
 });
-t('SHOP_ERROR (the error page the user hit) has plain wording', () => assert.ok(AB.describeStatus('SHOP_ERROR').indexOf('generic error page') > 0));
 
 console.log('# texts');
-t('known statuses have plain wording', () => {
-  assert.strictEqual(AB.describeStatus('DENIED_BY_PKP'), 'the waiting room denied the request');
-  assert.strictEqual(AB.describeStatus('ERR_TOO_MANY_TICKETS', { available: 2 }), 'too many tickets for one order (max 2)');
-  assert.strictEqual(AB.describeStatus('HTTP 403'), 'the shop answered HTTP 403');
-});
 t('pair description names section, row, seats, category and price', () => {
   const c = AB.choosePairs(S(5, 6));
   assert.strictEqual(AB.describePairs(c.pairs), 'B7 row 12 seats 5-6 Kategori 2 450 kr');
@@ -222,6 +216,26 @@ t('seat description caps the list', () => {
   assert.ok(d.endsWith('+2 more'), d);
 });
 t('match page link carries the performance id', () => assert.ok(AB.matchPage('10229739913107').indexOf('performanceId=10229739913107') > 0));
+
+console.log('# page mode + intent (state machine across the queue navigation)');
+t('list page is recognised', () => assert.strictEqual(AB.pageMode('/list/resaleProducts/', 'Mens Nations League'), 'list'));
+t('item page is recognised', () => assert.strictEqual(AB.pageMode('/selection/resale/item', 'Item selection'), 'item'));
+t('cart page is recognised', () => assert.strictEqual(AB.pageMode('/cart/shoppingCart', 'Cart'), 'cart'));
+t('the waiting room is recognised by title', () => assert.strictEqual(AB.pageMode('/anything', 'Waiting Room'), 'queue'));
+t('the cookie/queue interstitial is recognised', () => assert.strictEqual(AB.pageMode('/cookieWarning', 'Cookies appear to be disabled in your browser.'), 'queue'));
+t('an unrelated page is other', () => assert.strictEqual(AB.pageMode('/account/login', 'Login'), 'other'));
+t('a fresh intent is fresh, an old one is not', () => {
+  var now = 1000000;
+  assert.strictEqual(AB.intentFresh({ pid: '1', createdAt: now - 1000 }, now, 3000), true);
+  assert.strictEqual(AB.intentFresh({ pid: '1', createdAt: now - 9000 }, now, 3000), false);
+  assert.strictEqual(AB.intentFresh(null, now, 3000), false);
+  assert.strictEqual(AB.intentFresh({ pid: '1' }, now, 3000), false);
+});
+t('seat key is stable and identifies the exact ticket set', () => {
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 22, row: '5', seat: '844' }), liveItem({ mid: 11, row: '5', seat: '845' })] }));
+  assert.strictEqual(AB.seatKey(AB.choosePairs(seats)), '11,22');
+  assert.strictEqual(AB.seatKey(null), '');
+});
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

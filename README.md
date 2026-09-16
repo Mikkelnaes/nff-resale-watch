@@ -63,25 +63,37 @@ is verified against.
 ## Auto-basket userscript (reserves in your own browser)
 
 The basket on resale.fotball.no belongs to the browser session, not to the account
-(a basket made on the laptop is not visible after logging in on the phone), so the
-reservation has to happen in the browser you will pay from. `autobasket.user.js`
-does that. It does **not** poll the shop: it listens to the ntfy topic and acts when
-the cloud watcher's "TICKETS LISTED on NFF resale!" alert arrives.
+(a basket made on the laptop is not visible after logging in on the phone), and the
+buy step is gated by SecuTix's virtual waiting room, which bounces a background
+request but lets a real page navigation through (proven 16 Sep: "waiting room
+denied"). So `autobasket.user.js` does what a human does, but instantly, from the
+browser you will pay from.
 
-What it does on an alert, in the logged-in tab:
+How it works (v0.2, the "ride the queue" strategy):
 
-1. reads the per-match items JSON for Denmark and Portugal once (the same request
-   the match page makes);
-2. picks seats: 4 if two adjacent pairs exist (four in a row preferred), else 2 if
+1. **Detect fast.** On the resale list page it reads the Denmark and Portugal
+   listings every 3 s (`POLL_MS`) from your logged-in session, far faster than the
+   30 s cloud watcher. The ntfy alert is a secondary nudge to poll immediately.
+2. **Pick seats.** 4 if two adjacent pairs exist (four in a row preferred), else 2 if
    one adjacent pair exists, never 1 or 3. Adjacent = same section, same row, seat
-   numbers 1 apart. Tickets without seat numbers are never taken;
-3. sends the shop's own add-to-basket request (`POST /ajax/selection/resale/item/submit`);
-4. on success: a short quiet beep (2 s, `ALARM_SECONDS` / `ALARM_GAIN` in the script),
-   the tab title flashes for 10 s, phone push "Auto-basket: RESERVED ... pay NOW", opens
-   the basket. You pay by hand within the hold (about 15 minutes);
-5. on anything else (waiting room, captcha, tickets gone, request format not
-   recognised): alarm, phone push with the reason, opens the match page so you are
-   one click away. It then pauses 3 minutes so it does not reload the page under you.
+   numbers `ADJACENT_STEP` (1) apart. Tickets without seat numbers are never taken.
+   `EXCLUDE_AREA` is `null`, so any section is taken (including the away blocks); the
+   push names the section so you can decline at payment. Set the regex to skip them.
+3. **Grab by real navigation.** It stores the intent and navigates the tab to the
+   match page, entering the queue for real. When the page comes through, it fills the
+   page's own `ResaleItemFormModel` form and submits it (a real navigation the queue
+   trusts), landing in the cart.
+4. **On success:** a short quiet beep (2 s, `ALARM_SECONDS` / `ALARM_GAIN`), the tab
+   title flashes for 10 s, phone push "Auto-basket: RESERVED ... pay NOW", and the
+   cart opens. You pay by hand within the hold (about 15 minutes). Then it ignores
+   everything for `COOLDOWN_MS` (20 min).
+5. **On a miss** (still in the queue, tickets gone, shop refused): it goes back to the
+   list and keeps watching, to catch the ~15 min hold-expiry re-release, up to
+   `MAX_TRIES` (25) within `WINDOW_MS` (15 min), `BACKOFF_MS` (4 s) apart.
+
+It never pays; 3-D Secure is yours. Nothing bypasses a captcha (the resale item page
+loads none). The script runs as a small state machine across the list, item, queue
+and cart pages (`AB.pageMode`), carrying the grab intent in `localStorage`.
 
 Install (Chrome on the laptop):
 
@@ -97,10 +109,11 @@ Install (Chrome on the laptop):
 5. Leave the laptop on and awake (disable sleep), the tab open in its own window
    (not minimised). Keep one such tab; a second tab shows `standby`.
 
-Dry run: **Switch to dry run** makes it push "would reserve ..." and open the match
-page instead of reserving. **Reset** clears the cooldown after a reservation or the
-pause after a failure. A keepalive request every 10 minutes keeps the login alive
-(turn off with **Keepalive off**).
+Dry run: **Switch to dry run** makes it push "would reserve ..." and beep instead of
+navigating and reserving, so you can watch it detect real listings safely. **Reset**
+clears the reservation cooldown and the current grab target. A keepalive request every
+10 minutes keeps the login alive (turn off with **Keepalive off**). The overlay shows
+the page mode, poll status, and the current target with its try count.
 
 What the 15 Sep 2026 live capture confirmed (evidence artifact): the resale item
 JSON gives the section in `block` (e.g. `124`) and row+seat in `remark` (`"5 - 844"`
