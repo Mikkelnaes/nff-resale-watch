@@ -228,6 +228,25 @@ t('the real 17 Sep Portugal pair (one key, two seats) becomes ONE row with quant
   assert.deepStrictEqual(p.resaleItemData[0], { key: k, audienceSubCategoryId: 10229709001571, seatCategoryId: 10229721164073, quantity: 2, unitAmount: 890000, movementIds: [10229796417629, 10229796417630] });
   assert.deepStrictEqual(AB.payloadMissing(p), []);
 });
+console.log('# one-off smoke test chooser (reserve 1 ticket to prove the submit path)');
+t('chooseAny picks one ticket with an id, numbered seats first', () => {
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [
+    { movementIds: [1, 2], availableQuantity: 2, seatCategoryId: 1, audienceSubCategoryId: 1, realPrice: 100 },   // unnumbered bundle
+    liveItem({ mid: 77, row: '5', seat: '844' })] }));
+  const c = AB.chooseAny(seats, 1);
+  assert.strictEqual(c.count, 1);
+  assert.strictEqual(c.seats[0].movementId, 77);
+  assert.deepStrictEqual(AB.payloadMissing(AB.buildPayload(1, c.seats)), []);
+});
+t('chooseAny returns null when nothing has an id', () => assert.strictEqual(AB.chooseAny([], 1), null));
+t('a single real listing gives no pair but is a valid 1-ticket test target', () => {
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 5, row: '5', seat: '844' })] }));
+  assert.strictEqual(AB.choosePairs(seats), null, 'never 1 in normal mode');
+  const c = AB.chooseAny(seats, 1);
+  const p = AB.buildPayload(10229739913106, c.seats);
+  assert.strictEqual(p.resaleItemData[0].quantity, 1);
+  assert.ok(p.resaleItemData[0].key.indexOf('NFF_RESALE_') === 0);
+});
 t('checkout steps count as a successful landing', () => {
   assert.strictEqual(AB.pageMode('/checkout/beneficiaries', 'Checkout'), 'cart');
   assert.strictEqual(AB.pageMode('/cart/shoppingCart', 'Cart'), 'cart');

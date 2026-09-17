@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.2.1
+// @version      0.2.2
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,13 +36,14 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.2.1',
+    VERSION: '0.2.2',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
     EXCLUDE_AREA: null,           // e.g. /^(10[7-9]|11[0-2]|40[7-9]|41[0-4])$/ to skip the away blocks; null = any section
     POLL_MS: 3000,                // in-browser listing poll interval
     COOLDOWN_MS: 20 * 60 * 1000,  // after a reservation: ignore everything this long (basket hold ~15 min)
+    TEST_COOLDOWN_MS: 90 * 1000,  // after the one-off smoke test: short, so a real pair is not missed
     WINDOW_MS: 15 * 60 * 1000,    // keep chasing the same seats at most this long
     MAX_TRIES: 25,                // ...and at most this many navigations
     BACKOFF_MS: 4000,             // wait this long between attempts on the same seats
@@ -228,6 +229,15 @@
     if (!choice || !choice.seats) return '';
     return choice.seats.map(function (s) { return String(s.movementId); }).sort().join(',');
   };
+  // Smoke-test chooser: any n tickets with a movement id, no adjacency rule (used once, to
+  // prove the submit path on a single ticket that nobody wants; the user then empties the cart).
+  AB.chooseAny = function (seats, n) {
+    var ok = seats.filter(function (s) { return s.movementId !== undefined && s.movementId !== null; });
+    if (!ok.length) return null;
+    ok.sort(function (a, b) { return (b.seatNo !== null) - (a.seatNo !== null); });   // numbered seats first
+    var picked = ok.slice(0, n || 1);
+    return { count: picked.length, seats: picked, pairs: [] };
+  };
 
   // ---- basket request --------------------------------------------------------------
   // One resaleItemData entry per listing ROW, exactly as the page's own form posts it.
@@ -327,6 +337,7 @@
     topic: store.get('topic', ''),
     armed: store.get('armed', '1') === '1',
     keepalive: store.get('keepalive', '1') === '1',
+    testOnce: store.get('testOnce', '0') === '1',   // one-off: reserve the next single ticket to prove the submit path
     mode: '-', sse: null, sseState: 'not connected', pollLast: '-', lastEvent: '-', lastAction: 'idle',
     busy: false, leader: false, lastDry: '', tabId: Math.random().toString(36).slice(2), audio: null, flashTimer: null
   };
@@ -353,7 +364,7 @@
   box.innerHTML = '<div id="ab-status" style="white-space:pre-wrap"></div>' +
     '<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">' +
     '<button id="ab-audio">Arm audio / test alarm</button><button id="ab-toggle"></button>' +
-    '<button id="ab-topic">Topic</button><button id="ab-keep"></button><button id="ab-reset">Reset</button></div>';
+    '<button id="ab-topic">Topic</button><button id="ab-keep"></button><button id="ab-test"></button><button id="ab-reset">Reset</button></div>';
   function mountOverlay() { if (doc.body && !doc.getElementById('autobasket-box')) { doc.body.appendChild(box); wireButtons(); } }
   function render() {
     var el = doc.getElementById('ab-status'); if (!el) return;
@@ -364,9 +375,11 @@
       'page: ' + state.mode + '   topic: ' + (state.topic ? state.topic.slice(0, 6) + '...' : 'NOT SET') + '   ntfy: ' + state.sseState + '\n' +
       'this tab: ' + (state.leader ? 'active' : 'standby') + '   login: ' + loggedIn() + '   audio: ' + (state.audio ? 'armed' : 'NOT ARMED') + '\n' +
       'poll: ' + state.pollLast + '   last alert: ' + state.lastEvent + '\n' +
-      'last action: ' + state.lastAction + (grab ? '\ntarget: ' + grab.key + ' (try ' + grab.tries + '/' + AB.MAX_TRIES + ')' : '') + (cd ? '\n' + cd : '');
+      'last action: ' + state.lastAction + (grab ? '\ntarget: ' + grab.key + ' (try ' + grab.tries + '/' + AB.MAX_TRIES + ')' : '') + (cd ? '\n' + cd : '') +
+      (state.testOnce ? '\nTEST MODE: next single ticket is reserved once to prove the path (a real pair still wins)' : '');
     var tg = doc.getElementById('ab-toggle'); if (tg) tg.textContent = state.armed ? 'Switch to dry run' : 'ARM';
     var kp = doc.getElementById('ab-keep'); if (kp) kp.textContent = state.keepalive ? 'Keepalive off' : 'Keepalive on';
+    var tb = doc.getElementById('ab-test'); if (tb) tb.textContent = state.testOnce ? 'Cancel test' : 'Test on next single';
   }
   function wireButtons() {
     doc.getElementById('ab-audio').onclick = function () {
@@ -380,8 +393,12 @@
       var t = win.prompt('ntfy topic (same as the watcher\'s NTFY_TOPIC secret):', state.topic);
       if (t !== null) { state.topic = t.trim(); store.set('topic', state.topic); connectNtfy(); }
     };
+    doc.getElementById('ab-test').onclick = function () {
+      state.testOnce = !state.testOnce; store.set('testOnce', state.testOnce ? '1' : '0');
+      setAction(state.testOnce ? 'TEST MODE armed: the next single ticket will be reserved once (empty the cart afterwards)' : 'test mode off');
+    };
     doc.getElementById('ab-reset').onclick = function () {
-      ['reservedAt', 'grab', 'intent'].forEach(store.del); state.busy = false; state.lastDry = ''; setAction('reset');
+      ['reservedAt', 'grab', 'intent', 'testOnce'].forEach(store.del); state.busy = false; state.lastDry = ''; state.testOnce = false; setAction('reset');
     };
   }
 
@@ -469,18 +486,23 @@
 
   // ---- decide -------------------------------------------------------------------
   // -> a target {id,name,choice,payload,key,desc} when a complete, sendable pair exists, else null
-  function targetFor(id, raw) {
+  // testMode: if no real pair exists but at least one ticket does, return a 1-ticket
+  // smoke-test target (test:true). A real pair always takes precedence over the test.
+  function targetFor(id, raw, testMode) {
     var name = AB.MATCHES[id];
     var seats = AB.expandSeats(AB.normalizeItems(raw));
-    var choice = AB.choosePairs(seats, AB.WANT);
+    var choice = AB.choosePairs(seats, AB.WANT), test = false;
+    if (!choice && testMode && seats.length) { choice = AB.chooseAny(seats, 1); test = true; }
     if (!choice) return null;
     var payload = AB.buildPayload(id, choice.seats);
-    var desc = choice.count + ' x ' + name + ' (' + AB.describePairs(choice.pairs) + ')';
+    var desc = test
+      ? 'TEST 1 x ' + name + ' (' + AB.describeSeats(choice.seats) + ')'
+      : choice.count + ' x ' + name + ' (' + AB.describePairs(choice.pairs) + ')';
     if (AB.payloadMissing(payload).length) {
-      push('urgent', AB.OWN_TITLE_PREFIX + ': check ' + name, name + ' pair found (' + AB.describePairs(choice.pairs) + ') but the listing lacked the ids to reserve. Open the match page.', AB.matchPage(id));
+      push('urgent', AB.OWN_TITLE_PREFIX + ': check ' + name, name + ' found (' + desc + ') but the listing lacked the ids to reserve. Open the match page.', AB.matchPage(id));
       return null;
     }
-    return { id: id, name: name, choice: choice, payload: payload, key: AB.seatKey(choice), desc: desc };
+    return { id: id, name: name, choice: choice, payload: payload, key: AB.seatKey(choice), desc: desc, test: test };
   }
 
   // ---- list page: poll + grab ----------------------------------------------------
@@ -494,7 +516,7 @@
         if (found) return;
         return fetchItems(id).then(function (raw) {
           state.pollLast = hhmm() + ' ok';
-          var t = targetFor(id, raw); if (t && !found) found = t;
+          var t = targetFor(id, raw, state.testOnce); if (t && !found) found = t;
         }, function (err) { state.pollLast = hhmm() + ' ' + err; });
       });
     });
@@ -509,7 +531,7 @@
   }
   function act(target) {
     if (untilMs('reservedAt')) return;
-    if (!state.armed) {
+    if (!state.armed && !target.test) {   // the smoke test is a real reservation even in dry run
       if (state.lastDry === target.key) return;
       state.lastDry = target.key;
       setAction('DRY RUN would reserve ' + target.desc);
@@ -519,8 +541,10 @@
     }
     if (!canTry(target)) return;
     state.busy = true;
-    setJSON('intent', { pid: target.id, name: target.name, key: target.key, desc: target.desc, createdAt: Date.now(), status: 'go' });
-    setAction('grabbing ' + target.desc + ' -> entering the queue');
+    // The payload travels with the intent so the match page can submit at once (no re-read);
+    // a miss loops back to the list, which re-reads fresh data before the next try.
+    setJSON('intent', { pid: target.id, name: target.name, key: target.key, desc: target.desc, payload: target.payload, test: !!target.test, createdAt: Date.now(), status: 'go' });
+    setAction((target.test ? 'TEST: ' : '') + 'grabbing ' + target.desc + ' -> entering the queue');
     win.setTimeout(function () { win.location.href = AB.matchPage(target.id); }, 50);
   }
 
@@ -532,15 +556,21 @@
     if (win.location.search.indexOf('performanceId=' + pid) < 0) return;   // a match we are not chasing
     if (intent.status === 'submitting') { checkPostSubmit(); return; }
     setAction('through the queue on ' + intent.name + ', completing');
-    fetchItems(pid).then(function (raw) {
-      var t = targetFor(pid, raw);
+    var csrf = csrfFrom(doc.documentElement.innerHTML);
+    if (intent.payload && intent.payload.resaleItemData && intent.payload.resaleItemData.length) {
+      // Fast path: submit at once from what the list page already chose (saves a round trip).
+      // If it is stale the submit misses, we loop back to the list and re-read fresh data.
+      return submitRealForm(intent.payload, csrf, intent, intent.desc);
+    }
+    fetchItems(pid).then(function (raw) {   // legacy path: no payload carried, re-read here
+      var t = targetFor(pid, raw, !!intent.test);
       if (!t) return failGrab(intent, 'the listing was gone by the time the queue let us in');
-      var csrf = csrfFrom(doc.documentElement.innerHTML);
       submitRealForm(t.payload, csrf, intent, t.desc);
     }, function (err) { failGrab(intent, 'could not read the listing (' + err + ')'); });
   }
   function submitRealForm(payload, csrf, intent, desc) {
     intent.status = 'submitting'; intent.desc = desc; setJSON('intent', intent);
+    if (intent.test) { store.del('testOnce'); state.testOnce = false; }   // one shot: consumed the moment we actually send
     var form = doc.getElementById(AB.FORM_ID);
     if (!form) { return submitBg(payload, csrf, intent, desc); }
     Array.prototype.slice.call(form.querySelectorAll('input[name^="resaleItemData"], input[name="performanceId"]'))
@@ -565,9 +595,9 @@
       headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body: AB.buildFormBody(payload, csrf) })
       .then(function (r) {
         return r.text().then(function (t) {
-          if (/\/(cart|shoppingCart)/i.test(r.url) && !/error/i.test(r.url)) return succeed(desc, AB.BASKET_PATH);
+          if (/\/(cart|shoppingCart)/i.test(r.url) && !/error/i.test(r.url)) return succeed(desc, AB.BASKET_PATH, !!intent.test);
           var j = null; try { j = JSON.parse(t); } catch (e) { /* ignore */ }
-          if (j && j.status === 'OK') return succeed(desc, (j.parameters && j.parameters.redirect) || AB.BASKET_PATH);
+          if (j && j.status === 'OK') return succeed(desc, (j.parameters && j.parameters.redirect) || AB.BASKET_PATH, !!intent.test);
           failGrab(intent, 'shop refused (' + ((j && j.status) || 'queue/again') + ')');
         });
       }, function (e) { failGrab(intent, 'request failed: ' + e); });
@@ -578,7 +608,7 @@
     var intent = getJSON('intent');
     if (!intent || intent.status !== 'submitting') return false;
     var mode = pageMode();
-    if (mode === 'cart') { succeed(intent.desc, win.location.href); return true; }
+    if (mode === 'cart') { succeed(intent.desc, win.location.href, !!intent.test); return true; }
     if (mode === 'queue') { setAction('in the waiting room, holding for ' + intent.name); return true; }
     // Not the cart: report exactly where we landed so the next miss is diagnosable
     var where = win.location.pathname + win.location.search;
@@ -586,19 +616,30 @@
     failGrab(intent, 'submit landed on ' + where + ' ["' + doc.title + '"]: ' + errText);
     return true;
   }
-  function succeed(desc, redirect) {
+  function succeed(desc, redirect, test) {
     store.del('grab'); store.del('intent'); state.busy = false;
-    store.set('reservedAt', String(Date.now() + AB.COOLDOWN_MS));
-    setAction('RESERVED ' + desc);
-    alarm();
-    push('urgent', AB.OWN_TITLE_PREFIX + ': RESERVED', 'RESERVED ' + desc + '. Pay NOW on the laptop, the basket hold is about 15 minutes.', AB.BASKET_PATH);
+    if (test) {
+      store.del('testOnce'); state.testOnce = false;
+      store.set('reservedAt', String(Date.now() + AB.TEST_COOLDOWN_MS));
+      setAction('TEST OK: ' + desc + ' landed in the cart. EMPTY THE CART now to release it.');
+      alarm();
+      push('urgent', AB.OWN_TITLE_PREFIX + ' TEST OK', 'The submit path WORKS: ' + desc + ' landed in the cart. Empty the cart now so the ticket is released. Test mode is off; normal rules (2 or 4 adjacent) resume.', AB.BASKET_PATH);
+    } else {
+      store.set('reservedAt', String(Date.now() + AB.COOLDOWN_MS));
+      setAction('RESERVED ' + desc);
+      alarm();
+      push('urgent', AB.OWN_TITLE_PREFIX + ': RESERVED', 'RESERVED ' + desc + '. Pay NOW on the laptop, the basket hold is about 15 minutes.', AB.BASKET_PATH);
+    }
     win.setTimeout(function () { win.location.href = redirect || AB.BASKET_PATH; }, 300);
   }
   function failGrab(intent, reason) {
     var grab = getJSON('grab'); if (grab) { grab.tries = (grab.tries || 0) + 1; grab.nextTryAt = Date.now() + AB.BACKOFF_MS; setJSON('grab', grab); }
     store.del('intent'); state.busy = false;
-    setAction('miss: ' + reason + ' -> back to watching');
-    push('default', AB.OWN_TITLE_PREFIX + ' miss', (intent && intent.name || '') + ': ' + reason + '. Still watching.', intent && AB.matchPage(intent.pid));
+    var test = !!(intent && intent.test);
+    if (test) { store.del('testOnce'); state.testOnce = false; }   // one shot, even on a miss: we have the diagnostic now
+    setAction((test ? 'TEST miss: ' : 'miss: ') + reason + ' -> back to watching');
+    push(test ? 'urgent' : 'default', AB.OWN_TITLE_PREFIX + (test ? ' TEST FAILED' : ' miss'),
+      (intent && intent.name || '') + ': ' + reason + (test ? ' (test mode off; send this to Claude)' : '. Still watching.'), intent && AB.matchPage(intent.pid));
     win.setTimeout(function () { if (pageMode() !== 'list') win.location.href = AB.LIST_PATH; }, 500);
   }
 
