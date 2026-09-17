@@ -22,10 +22,13 @@ function siteItem(o) {   // SecuTix-style: ids + movementIds + seatPath
 function fixtureItem(o) {  // shape of test-fixtures/items-hit.json (no ids for the request)
   return { itemId: o.mid, seatCategory: 'Kategori 2', area: o.area || 'B7', row: o.row || '12', seat: String(o.seat), price: 450, priceWithCharge: 470, audienceSubCategory: 'Ordinær' };
 }
-function liveItem(o) {  // real 15 Sep capture shape: block + remark "row - seat", price null, realPrice in thousandths
-  return { seatCatName: 'Category 3', seatArea: 'KIWI-Bama-svingen', block: o.block || '124', seatCategoryId: 10229721164074,
+function liveItem(o) {  // real 15/17 Sep capture shape: block + remark "row - seat", price null, realPrice in thousandths,
+  // shared `key` per listing row, and the buyer's tariff in pricesSelection ("Resale"), not the ticket's "Adult"
+  return { key: o.key || 'NFF_RESALE_10229739619905_10229739913106_10229739620577_10229718202442_10229721214948_10229708951675_10229721164074_null',
+    seatCatName: 'Category 3', seatArea: 'KIWI-Bama-svingen', block: o.block || '124', seatCategoryId: 10229721164074,
     audienceSubCategory: 'Adult', quantity: 1, price: null, priceWithCharge: 690000, realPrice: 690000,
-    remark: (o.row || '5') + ' - ' + o.seat, itemId: o.mid, audienceSubCategoryId: 10229708951675, movementIds: [o.mid], resaleSeats: [] };
+    remark: (o.row || '5') + ' - ' + o.seat, itemId: o.mid, audienceSubCategoryId: 10229708951675, movementIds: [o.mid], resaleSeats: [],
+    pricesSelection: [{ audienceSubCatId: 10229709001571, audienceSubCatName: 'Resale', audienceSubCatRank: 99, audienceCatKind: 'FULL', priceLevelCode: '', priceLevelId: null, amount: 690000 }] };
 }
 const seatsFrom = (items) => AB.expandSeats(AB.normalizeItems({ resaleItems: items }));
 const nos = (choice) => choice.seats.map((s) => s.seatNo).sort((a, b) => a - b);
@@ -85,7 +88,14 @@ t('real 15 Sep capture: block as area, remark parsed to row/seat, price from rea
   assert.strictEqual(it.price, 690000);
   assert.deepStrictEqual(it.movementIds, [10229785519841]);
   assert.strictEqual(it.seatCategoryId, 10229721164074);
+  assert.strictEqual(it.audienceSubCategoryId, 10229709001571, 'buyer tariff comes from pricesSelection (Resale), not the ticket\'s Adult tariff');
+  assert.ok(it.key && it.key.indexOf('NFF_RESALE_') === 0);
+});
+t('without pricesSelection the ticket\'s own tariff and realPrice are used', () => {
+  const raw = liveItem({ mid: 1, row: '5', seat: '844' }); delete raw.pricesSelection;
+  const it = AB.normalizeItems({ resaleItems: [raw] })[0];
   assert.strictEqual(it.audienceSubCategoryId, 10229708951675);
+  assert.strictEqual(it.price, 690000);
 });
 t('two real-shape tickets in the same row form a complete, sendable pair', () => {
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 1, row: '5', seat: '844' }), liveItem({ mid: 2, row: '5', seat: '845' })] }));
@@ -185,7 +195,8 @@ t('form body mirrors the match page fields and carries the csrf', () => {
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 111, row: '5', seat: '844' }), liveItem({ mid: 112, row: '5', seat: '845' })] }));
   const body = AB.buildFormBody(AB.buildPayload(10229739913106, AB.choosePairs(seats).seats), 'tok-123');
   assert.ok(body.indexOf('performanceId=10229739913106') === 0, body);
-  assert.ok(body.indexOf('resaleItemData%5B0%5D.audienceSubCategoryId=10229708951675') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.key=NFF_RESALE_') > 0, 'form carries the row key: ' + body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.audienceSubCategoryId=10229709001571') > 0, 'form carries the Resale tariff: ' + body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.seatCategoryId=10229721164074') > 0, body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.quantity=2') > 0, body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.unitAmount=690000') > 0, body);
@@ -193,13 +204,33 @@ t('form body mirrors the match page fields and carries the csrf', () => {
   assert.ok(body.indexOf('resaleItemData%5B0%5D.movementIds%5B1%5D=112') > 0, body);
   assert.ok(body.endsWith('_csrf=tok-123'), body);
 });
-t('two different-priced pairs make two form entries', () => {
+t('two rows (different keys and prices) make two form entries', () => {
+  const dear = { pricesSelection: [{ audienceSubCatId: 10229709001571, amount: 990000 }], realPrice: 990000, priceWithCharge: 990000, seatCategoryId: 55 };
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [
     liveItem({ mid: 1, row: '5', seat: '10' }), liveItem({ mid: 2, row: '5', seat: '11' }),
-    Object.assign(liveItem({ mid: 3, row: '9', seat: '20' }), { realPrice: 990000, priceWithCharge: 990000, seatCategoryId: 55 }),
-    Object.assign(liveItem({ mid: 4, row: '9', seat: '21' }), { realPrice: 990000, priceWithCharge: 990000, seatCategoryId: 55 })] }));
-  const body = AB.buildFormBody(AB.buildPayload(1, AB.choosePairs(seats).seats), 'x');
+    Object.assign(liveItem({ mid: 3, row: '9', seat: '20', key: 'NFF_RESALE_ROW_B' }), dear),
+    Object.assign(liveItem({ mid: 4, row: '9', seat: '21', key: 'NFF_RESALE_ROW_B' }), dear)] }));
+  const payload = AB.buildPayload(1, AB.choosePairs(seats).seats);
+  assert.strictEqual(payload.resaleItemData.length, 2);
+  const body = AB.buildFormBody(payload, 'x');
   assert.ok(body.indexOf('resaleItemData%5B1%5D.unitAmount=990000') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B1%5D.key=NFF_RESALE_ROW_B') > 0, body);
+});
+t('the real 17 Sep Portugal pair (one key, two seats) becomes ONE row with quantity 2 and both movement ids', () => {
+  const k = 'NFF_RESALE_10229739619905_10229739913107_10229739620585_10229718202440_10229721214995_10229708951675_10229721164073_null';
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [
+    Object.assign(liveItem({ mid: 10229796417629, row: '27', seat: '417', key: k, block: '411' }), { seatCategoryId: 10229721164073, realPrice: 890000, pricesSelection: [{ audienceSubCatId: 10229709001571, amount: 890000 }] }),
+    Object.assign(liveItem({ mid: 10229796417630, row: '27', seat: '418', key: k, block: '411' }), { seatCategoryId: 10229721164073, realPrice: 890000, pricesSelection: [{ audienceSubCatId: 10229709001571, amount: 890000 }] })] }));
+  const c = AB.choosePairs(seats);
+  assert.strictEqual(c.count, 2);
+  const p = AB.buildPayload(10229739913107, c.seats);
+  assert.strictEqual(p.resaleItemData.length, 1);
+  assert.deepStrictEqual(p.resaleItemData[0], { key: k, audienceSubCategoryId: 10229709001571, seatCategoryId: 10229721164073, quantity: 2, unitAmount: 890000, movementIds: [10229796417629, 10229796417630] });
+  assert.deepStrictEqual(AB.payloadMissing(p), []);
+});
+t('checkout steps count as a successful landing', () => {
+  assert.strictEqual(AB.pageMode('/checkout/beneficiaries', 'Checkout'), 'cart');
+  assert.strictEqual(AB.pageMode('/cart/shoppingCart', 'Cart'), 'cart');
 });
 
 console.log('# texts');

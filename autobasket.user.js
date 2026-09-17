@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.2.0
+// @version      0.2.1
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.2.0',
+    VERSION: '0.2.1',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -143,11 +143,18 @@
       if (qty === null) qty = mids.length || 1;
       var cat = pick(it, ['seatCatName', 'seatCategoryName', 'seatCategory', 'categoryName']);
       if (cat && typeof cat === 'object') cat = pick(cat, ['name', 'label']);
+      // The buyer purchases at the tariff offered in pricesSelection ("Resale"), not the
+      // ticket's original tariff (audienceSubCategoryId = "Adult"). The page's own form
+      // sends the selected pricesSelection entry, so that is what the request must carry.
+      var ps = Array.isArray(it.pricesSelection) && it.pricesSelection.length ? it.pricesSelection[0] : null;
+      var tariff = ps ? pick(ps, ['audienceSubCatId', 'audienceSubCategoryId']) : undefined;
+      var amount = ps ? num(pick(ps, ['amount', 'unitAmount', 'price'])) : null;
       return {
+        key: pick(it, ['key']),   // the row identity the form posts as resaleItemData[i].key
         movementIds: mids,
         seatCategoryId: pick(it, ['seatCategoryId', 'seatCategory.id', 'seatCatId', 'categoryId']),
-        audienceSubCategoryId: pick(it, ['audienceSubCategoryId', 'audienceSubCategory.id', 'audSubCatId', 'tariffId']),
-        price: num(pick(it, ['realPrice', 'priceWithCharge', 'price', 'unitAmount', 'unitPrice', 'amount'])),
+        audienceSubCategoryId: tariff !== undefined ? tariff : pick(it, ['audienceSubCategoryId', 'audienceSubCategory.id', 'audSubCatId', 'tariffId']),
+        price: amount !== null ? amount : num(pick(it, ['realPrice', 'priceWithCharge', 'price', 'unitAmount', 'unitPrice', 'amount'])),
         category: str(cat),
         quantity: qty,
         place: AB.parsePlace(it),
@@ -223,13 +230,18 @@
   };
 
   // ---- basket request --------------------------------------------------------------
+  // One resaleItemData entry per listing ROW, exactly as the page's own form posts it.
+  // Rows are identified by the listing's `key` (both seats of the 17 Sep Portugal pair
+  // shared one key: one row, quantity 2, two movementIds). Without a key we fall back
+  // to grouping by tariff/category/price.
   AB.buildPayload = function (performanceId, seats) {
     var groups = {}, order = [];
     seats.forEach(function (s) {
-      var it = s.item, key = [it.audienceSubCategoryId, it.seatCategoryId, it.price].join('|');
+      var it = s.item, key = it.key || [it.audienceSubCategoryId, it.seatCategoryId, it.price].join('|');
       if (!groups[key]) {
         groups[key] = { audienceSubCategoryId: it.audienceSubCategoryId, seatCategoryId: it.seatCategoryId,
                         quantity: 0, unitAmount: it.price, movementIds: [] };
+        if (it.key !== undefined && it.key !== null) groups[key].key = it.key;   // only when the listing has one
         order.push(key);
       }
       groups[key].quantity += 1;
@@ -255,6 +267,7 @@
     var parts = [['performanceId', payload.performanceId]];
     (payload.resaleItemData || []).forEach(function (d, i) {
       var p = 'resaleItemData[' + i + '].';
+      if (d.key !== undefined && d.key !== null) parts.push([p + 'key', d.key]);
       parts.push([p + 'audienceSubCategoryId', d.audienceSubCategoryId]);
       parts.push([p + 'seatCategoryId', d.seatCategoryId]);
       parts.push([p + 'quantity', d.quantity]);
@@ -288,7 +301,7 @@
   AB.pageMode = function (pathname, title) {
     pathname = pathname || ''; title = title || '';
     if (/Waiting Room|Cookies appear to be disabled/i.test(title) || /cookieWarning|pkpcontroller/i.test(pathname)) return 'queue';
-    if (/\/cart(\/|\b)/i.test(pathname)) return 'cart';
+    if (/\/cart(\/|\b)|\/checkout(\/|\b)/i.test(pathname)) return 'cart';   // checkout steps mean the basket holds the seats
     if (/\/selection\/resale\/item(\?|\b)/i.test(pathname)) return 'item';
     if (/\/list\/resale/i.test(pathname)) return 'list';
     return 'other';
@@ -536,6 +549,7 @@
     add('performanceId', payload.performanceId);
     payload.resaleItemData.forEach(function (d, idx) {
       var p = 'resaleItemData[' + idx + '].';
+      if (d.key !== undefined && d.key !== null) add(p + 'key', d.key);
       add(p + 'audienceSubCategoryId', d.audienceSubCategoryId);
       add(p + 'seatCategoryId', d.seatCategoryId);
       add(p + 'quantity', d.quantity);
@@ -566,7 +580,10 @@
     var mode = pageMode();
     if (mode === 'cart') { succeed(intent.desc, win.location.href); return true; }
     if (mode === 'queue') { setAction('in the waiting room, holding for ' + intent.name); return true; }
-    failGrab(intent, 'the reservation did not land in the cart');
+    // Not the cart: report exactly where we landed so the next miss is diagnosable
+    var where = win.location.pathname + win.location.search;
+    var errText = (doc.body && doc.body.innerText || '').replace(/\s+/g, ' ').slice(0, 160);
+    failGrab(intent, 'submit landed on ' + where + ' ["' + doc.title + '"]: ' + errText);
     return true;
   }
   function succeed(desc, redirect) {
