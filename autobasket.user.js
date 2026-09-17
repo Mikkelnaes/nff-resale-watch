@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.2.2
+// @version      0.2.3
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.2.2',
+    VERSION: '0.2.3',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -474,6 +474,9 @@
     return win.fetch(AB.ITEMS_PATH + '?performanceId=' + id + '&lang=en', { credentials: 'same-origin', headers: { 'Accept': 'application/json, text/javascript, */*; q=0.01', 'X-Requested-With': 'XMLHttpRequest' } })
       .then(function (r) {
         return r.text().then(function (t) {
+          // NFF made this endpoint login-only on 17 Sep 2026; the logged-in tab still gets
+          // JSON, but if the session drops we get the login page instead of silent nonsense.
+          if (/\/account\/(login|identification)/i.test(r.url) || /action="\/account\/login"|<title>Identification/i.test(t)) throw 'login';
           if (!r.ok) throw 'HTTP ' + r.status;
           try { return JSON.parse(t); } catch (e) { throw /Waiting Room/i.test(t) ? 'waiting room' : 'non-JSON'; }
         });
@@ -515,9 +518,17 @@
       chain = chain.then(function () {
         if (found) return;
         return fetchItems(id).then(function (raw) {
-          state.pollLast = hhmm() + ' ok';
+          state.pollLast = hhmm() + ' ok'; state.loginWarned = false;
           var t = targetFor(id, raw, state.testOnce); if (t && !found) found = t;
-        }, function (err) { state.pollLast = hhmm() + ' ' + err; });
+        }, function (err) {
+          state.pollLast = hhmm() + ' ' + err;
+          if (err === 'login' && !state.loginWarned) {   // session dropped: tell the phone once
+            state.loginWarned = true;
+            setAction('SESSION EXPIRED - log in again on resale.fotball.no');
+            alarm();
+            push('urgent', AB.OWN_TITLE_PREFIX + ': LOG IN', 'Your resale.fotball.no session dropped, so the auto-basket is blind. Open the tab and log in again.', AB.LIST_PATH);
+          }
+        });
       });
     });
     return chain.then(function () { render(); if (found) act(found); });

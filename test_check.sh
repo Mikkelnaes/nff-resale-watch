@@ -33,7 +33,7 @@ assert_not_contains() { grep -qF -- "$2" <<<"$out" && ko "$1" "unexpected: $2" |
 assert_notify_count() { local got; got=$(grep -c '^NOTIFY ' <<<"$out"); [ "$got" -eq "$2" ] && ok "$1" || ko "$1" "expected $2 NOTIFY lines, got $got"; }
 
 E=$F/catalog-empty.json; H=$F/catalog-hit.json; O=$F/catalog-other.json
-IE=$F/items-empty.json; IH=$F/items-hit.json
+IE=$F/items-empty.json; IH=$F/items-hit.json; IL=$F/items-login.html
 SS=$F/shop-soldout.html; SD=$F/shop-onsale-denmark.html; WR=$F/waiting-room.html
 
 echo "# nothing listed anywhere (the normal state)"
@@ -117,6 +117,19 @@ assert_notify_count   "fetch failure mid-hour sends nothing" 0
 run "$tmp/does-not-exist.json" $IE $IE $SS 14 00
 assert_notify_count   "fetch failure at top of hour sends one notification" 1
 assert_contains       "fetch failure notification says fetch failed" "fetch failed"
+
+echo "# per-match items now require login (NFF change 17 Sep 2026): AUTH, not a scary error"
+run $E $IL $IL $SS 14 30
+assert_rc0            "login-redirect on items exits 0"
+assert_contains       "login-redirect is reported as AUTH, not ERR" "denmark=AUTH portugal=AUTH"
+assert_not_contains   "  ...and does not set resale=ERROR" "resale=ERROR"
+run $E $IL $IL $SS 14 00
+assert_notify_count   "login-redirect at top of hour sends NO fetch-failed alert" 0
+run $H $IL $IL $SS 14 30
+assert_contains       "with catalog qty>0 and per-match behind login it still HITs" "resale=HIT"
+assert_notify_count   "  ...and sends the urgent catalog alert" 1
+assert_contains       "  ...whose message says the per-match list needs login" "needs login"
+assert_not_contains   "  ...and never claims none for Denmark or Portugal" "none for Denmark"
 
 echo "# per-match item fetch failure with an otherwise quiet catalog"
 run $E MISSING $IE $SS 14 30

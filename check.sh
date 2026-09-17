@@ -115,14 +115,21 @@ notify_once() {  # notify_once <priority> <title> <click url> <message>; skipped
 }
 
 is_waiting_room() { grep -q '<title>Waiting Room</title>' "$1" 2>/dev/null; }
+# NFF started requiring login on the per-match resaleItems.json endpoint on 17 Sep 2026;
+# an anonymous request now redirects to the login page. Detect that so it is reported as
+# AUTH (login needed), not a scary parse ERROR. The logged-in browser userscript is
+# unaffected; the catalog and shop are still readable anonymously.
+is_login() { grep -qE 'action="/account/login"|<title>Identification' "$1" 2>/dev/null; }
 
-# fetch <url> <outfile> [<test hook file>] -> FETCH=OK|QUEUE|ERROR, FETCH_ERR=<detail>
+# fetch <url> <outfile> [<test hook file>] -> FETCH=OK|QUEUE|AUTH|ERROR, FETCH_ERR=<detail>
 fetch() {
   local url=$1 out=$2 hook=${3:-} attempt res code final
   FETCH=ERROR; FETCH_ERR=''
   if [ -n "$hook" ]; then
     if cp "$hook" "$out" 2>/dev/null; then
-      if is_waiting_room "$out"; then FETCH=QUEUE; FETCH_ERR='waiting room'; else FETCH=OK; fi
+      if is_waiting_room "$out"; then FETCH=QUEUE; FETCH_ERR='waiting room'
+      elif is_login "$out"; then FETCH=AUTH; FETCH_ERR='login required'
+      else FETCH=OK; fi
     else
       FETCH_ERR="cannot read $hook"
     fi
@@ -134,6 +141,8 @@ fetch() {
     code=${res%% *}; final=${res#* }
     if [[ "$final" == *pkpcontroller* ]] || is_waiting_room "$out"; then
       FETCH=QUEUE; FETCH_ERR="waiting room after $attempt attempt(s)"
+    elif [[ "$final" == */account/login* ]] || [[ "$final" == */account/identification* ]] || is_login "$out"; then
+      FETCH=AUTH; FETCH_ERR="login required (endpoint no longer anonymous)"; return
     elif [ "$code" = "200" ]; then
       FETCH=OK; FETCH_ERR=''; return
     else
@@ -177,7 +186,7 @@ case $FETCH in
 esac
 
 # --- 2. per-match resale items ---------------------------------------------------
-counts_log=''; hit_lines=''; hit_click=''; hit_ids=''; items_err=''; heartbeat_resale=''
+counts_log=''; hit_lines=''; hit_click=''; hit_ids=''; items_err=''; heartbeat_resale=''; auth_seen=false
 for m in $MATCHES; do
   id=${m%%:*}; name=${m#*:}
   url=${ITEMS_URL_TEMPLATE//\{id\}/$id}
@@ -189,6 +198,7 @@ for m in $MATCHES; do
       count=$(sed -n 's/^count=//p' <<<"$c"); summary=$(sed -n 's/^summary=//p' <<<"$c")
     else items_err="$name items parse: $(parse_err)"; fi
   elif [ "$FETCH" = QUEUE ]; then count=QUEUE
+  elif [ "$FETCH" = AUTH ]; then count=AUTH; auth_seen=true   # endpoint now needs login; not an error, the catalog still signals
   else items_err="$name items: $FETCH_ERR"
   fi
   counts_log+="${name,,}=$count "
@@ -210,7 +220,11 @@ if [ -n "$hit_click" ]; then
 elif [ -z "$resale_state" ]; then
   if [[ "$qty" =~ ^[0-9]+$ ]] && [ "$qty" -gt 0 ]; then
     resale_state=HIT; hit_click=$LIST_PAGE
-    resale_msg="Nations League resale shows $qty ticket(s) but none for Denmark or Portugal. Could be the 14 Nov match. Check resale.fotball.no."
+    if $auth_seen; then
+      resale_msg="Nations League resale shows $qty ticket(s). Per-match list needs login now, so this could be Denmark, Portugal or 14 Nov. Open resale.fotball.no and let the browser auto-basket handle it."
+    else
+      resale_msg="Nations League resale shows $qty ticket(s) but none for Denmark or Portugal. Could be the 14 Nov match. Check resale.fotball.no."
+    fi
   elif [ -n "$others" ]; then
     resale_state=SOMETHING
   else
