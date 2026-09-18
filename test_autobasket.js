@@ -28,7 +28,7 @@ function liveItem(o) {  // real 15/17 Sep capture shape: block + remark "row - s
     seatCatName: 'Category 3', seatArea: 'KIWI-Bama-svingen', block: o.block || '124', seatCategoryId: 10229721164074,
     audienceSubCategory: 'Adult', quantity: 1, price: null, priceWithCharge: 690000, realPrice: 690000,
     remark: (o.row || '5') + ' - ' + o.seat, itemId: o.mid, audienceSubCategoryId: 10229708951675, movementIds: [o.mid], resaleSeats: [],
-    pricesSelection: [{ audienceSubCatId: 10229709001571, audienceSubCatName: 'Resale', audienceSubCatRank: 99, audienceCatKind: 'FULL', priceLevelCode: '', priceLevelId: null, amount: 690000 }] };
+    pricesSelection: [{ audienceSubCatId: 10229709001571, audienceSubCatName: 'Resale', audienceSubCatRank: 99, audienceCatKind: 'FULL', priceLevelCode: '', priceLevelId: (o.plId === undefined ? null : o.plId), amount: 690000 }] };
 }
 const seatsFrom = (items) => AB.expandSeats(AB.normalizeItems({ resaleItems: items }));
 const nos = (choice) => choice.seats.map((s) => s.seatNo).sort((a, b) => a - b);
@@ -173,7 +173,7 @@ t('payload groups by tariff/category/price and lists exactly the chosen movement
   const p = AB.buildPayload('10229739913106', c.seats);
   assert.strictEqual(p.performanceId, 10229739913106);
   assert.strictEqual(p.resaleItemData.length, 1);
-  assert.deepStrictEqual(p.resaleItemData[0], { audienceSubCategoryId: 901, seatCategoryId: 501, quantity: 4, unitAmount: 450, movementIds: [100, 101, 102, 103] });
+  assert.deepStrictEqual(p.resaleItemData[0], { key: null, audienceSubCategoryId: 901, seatCategoryId: 501, priceLevelId: null, quantity: 4, unitAmount: 450, movementIds: [100, 101, 102, 103] });
   assert.deepStrictEqual(AB.payloadMissing(p), []);
 });
 t('pairs with different prices become separate entries', () => {
@@ -225,8 +225,22 @@ t('the real 17 Sep Portugal pair (one key, two seats) becomes ONE row with quant
   assert.strictEqual(c.count, 2);
   const p = AB.buildPayload(10229739913107, c.seats);
   assert.strictEqual(p.resaleItemData.length, 1);
-  assert.deepStrictEqual(p.resaleItemData[0], { key: k, audienceSubCategoryId: 10229709001571, seatCategoryId: 10229721164073, quantity: 2, unitAmount: 890000, movementIds: [10229796417629, 10229796417630] });
+  assert.deepStrictEqual(p.resaleItemData[0], { key: k, audienceSubCategoryId: 10229709001571, seatCategoryId: 10229721164073, priceLevelId: null, quantity: 2, unitAmount: 890000, movementIds: [10229796417629, 10229796417630] });
   assert.deepStrictEqual(AB.payloadMissing(p), []);
+});
+t('the form body carries priceLevelId (empty when null) and key, matching the page addToCart', () => {
+  const k = 'NFF_RESALE_ROW_X';
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [
+    liveItem({ mid: 1, row: '5', seat: '10', key: k }), liveItem({ mid: 2, row: '5', seat: '11', key: k })] }));
+  const body = AB.buildFormBody(AB.buildPayload(1, AB.choosePairs(seats).seats), 'tok');
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.priceLevelId=&') > 0 || body.indexOf('resaleItemData%5B0%5D.priceLevelId=') > 0, 'priceLevelId field present: ' + body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.key=NFF_RESALE_ROW_X') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.seatCategoryId=') > 0, body);
+});
+t('a non-null priceLevelId is carried through', () => {
+  const it = AB.normalizeItems({ resaleItems: [liveItem({ mid: 1, row: '5', seat: '10', plId: 777 })] })[0];
+  assert.strictEqual(it.priceLevelId, 777);
+  assert.strictEqual(AB.buildPayload(1, AB.expandSeats([]).concat()).resaleItemData.length, 0);
 });
 console.log('# one-off smoke test chooser (reserve 1 ticket to prove the submit path)');
 t('chooseAny picks one ticket with an id, numbered seats first', () => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.2.3
+// @version      0.2.4
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.2.3',
+    VERSION: '0.2.4',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -150,10 +150,16 @@
       var ps = Array.isArray(it.pricesSelection) && it.pricesSelection.length ? it.pricesSelection[0] : null;
       var tariff = ps ? pick(ps, ['audienceSubCatId', 'audienceSubCategoryId']) : undefined;
       var amount = ps ? num(pick(ps, ['amount', 'unitAmount', 'price'])) : null;
+      // The seated resale form (stx2js addToCart for resaleItems.json) posts, per row:
+      // audienceSubCategoryId, seatCategoryId, quantity, unitAmount, key, priceLevelId, movementIds.
+      // priceLevelId comes from the selected price (often null) and MUST be sent even when null,
+      // or a 2-seat submit is rejected back to the item page (proven 18 Sep on the 421 pair).
+      var plId = ps && ('priceLevelId' in ps) ? ps.priceLevelId : pick(it, ['priceLevelId']);
       return {
         key: pick(it, ['key']),   // the row identity the form posts as resaleItemData[i].key
         movementIds: mids,
         seatCategoryId: pick(it, ['seatCategoryId', 'seatCategory.id', 'seatCatId', 'categoryId']),
+        priceLevelId: plId === undefined ? null : plId,
         audienceSubCategoryId: tariff !== undefined ? tariff : pick(it, ['audienceSubCategoryId', 'audienceSubCategory.id', 'audSubCatId', 'tariffId']),
         price: amount !== null ? amount : num(pick(it, ['realPrice', 'priceWithCharge', 'price', 'unitAmount', 'unitPrice', 'amount'])),
         category: str(cat),
@@ -249,9 +255,9 @@
     seats.forEach(function (s) {
       var it = s.item, key = it.key || [it.audienceSubCategoryId, it.seatCategoryId, it.price].join('|');
       if (!groups[key]) {
-        groups[key] = { audienceSubCategoryId: it.audienceSubCategoryId, seatCategoryId: it.seatCategoryId,
+        groups[key] = { key: it.key !== undefined ? it.key : null, audienceSubCategoryId: it.audienceSubCategoryId,
+                        seatCategoryId: it.seatCategoryId, priceLevelId: it.priceLevelId !== undefined ? it.priceLevelId : null,
                         quantity: 0, unitAmount: it.price, movementIds: [] };
-        if (it.key !== undefined && it.key !== null) groups[key].key = it.key;   // only when the listing has one
         order.push(key);
       }
       groups[key].quantity += 1;
@@ -275,13 +281,14 @@
   // byte-for-byte what clicking the page's button sends. Also used for the fallback POST.
   AB.buildFormBody = function (payload, csrf) {
     var parts = [['performanceId', payload.performanceId]];
-    (payload.resaleItemData || []).forEach(function (d, i) {
+    (payload.resaleItemData || []).forEach(function (d, i) {   // same fields and order as the page's own addToCart
       var p = 'resaleItemData[' + i + '].';
-      if (d.key !== undefined && d.key !== null) parts.push([p + 'key', d.key]);
       parts.push([p + 'audienceSubCategoryId', d.audienceSubCategoryId]);
       parts.push([p + 'seatCategoryId', d.seatCategoryId]);
       parts.push([p + 'quantity', d.quantity]);
       parts.push([p + 'unitAmount', d.unitAmount]);
+      parts.push([p + 'key', d.key]);
+      parts.push([p + 'priceLevelId', d.priceLevelId]);
       (d.movementIds || []).forEach(function (mid, j) { parts.push([p + 'movementIds[' + j + ']', mid]); });
     });
     if (csrf) parts.push(['_csrf', csrf]);
@@ -590,11 +597,12 @@
     add('performanceId', payload.performanceId);
     payload.resaleItemData.forEach(function (d, idx) {
       var p = 'resaleItemData[' + idx + '].';
-      if (d.key !== undefined && d.key !== null) add(p + 'key', d.key);
       add(p + 'audienceSubCategoryId', d.audienceSubCategoryId);
       add(p + 'seatCategoryId', d.seatCategoryId);
       add(p + 'quantity', d.quantity);
       add(p + 'unitAmount', d.unitAmount);
+      add(p + 'key', d.key);
+      add(p + 'priceLevelId', d.priceLevelId);
       (d.movementIds || []).forEach(function (mid, j) { add(p + 'movementIds[' + j + ']', mid); });
     });
     if (csrf && !form.querySelector('input[name="_csrf"]')) add('_csrf', csrf);
