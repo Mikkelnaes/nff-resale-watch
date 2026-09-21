@@ -105,7 +105,8 @@ t('two real-shape tickets in the same row form a complete, sendable pair', () =>
   const p = AB.buildPayload(10229739913106, c.seats);
   assert.deepStrictEqual(AB.payloadMissing(p), []);
   assert.strictEqual(p.resaleItemData[0].unitAmount, 690000);
-  assert.deepStrictEqual(p.resaleItemData[0].movementIds, [1, 2]);
+  assert.strictEqual(p.resaleItemData.length, 2, 'one entry per seat');
+  assert.deepStrictEqual(p.resaleItemData.map((d) => d.movementIds[0]), [1, 2]);
 });
 t('real-shape seats one apart in different rows are not a pair', () => {
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 1, row: '5', seat: '844' }), liveItem({ mid: 2, row: '6', seat: '845' })] }));
@@ -168,19 +169,22 @@ t('excluded sections are skipped', () => {
 });
 
 console.log('# basket request');
-t('payload groups by tariff/category/price and lists exactly the chosen movement ids', () => {
+t('payload is one entry PER SEAT (quantity 1 each), as the seated page posts it', () => {
   const c = AB.choosePairs(S(5, 6, 7, 8));
   const p = AB.buildPayload('10229739913106', c.seats);
   assert.strictEqual(p.performanceId, 10229739913106);
-  assert.strictEqual(p.resaleItemData.length, 1);
-  assert.deepStrictEqual(p.resaleItemData[0], { key: null, audienceSubCategoryId: 901, seatCategoryId: 501, priceLevelId: null, quantity: 4, unitAmount: 450, movementIds: [100, 101, 102, 103] });
+  assert.strictEqual(p.resaleItemData.length, 4);
+  assert.deepStrictEqual(p.resaleItemData[0], { key: null, audienceSubCategoryId: 901, seatCategoryId: 501, priceLevelId: null, quantity: 1, unitAmount: 450, movementIds: [100] });
+  assert.deepStrictEqual(p.resaleItemData.map((d) => d.movementIds[0]), [100, 101, 102, 103]);
+  assert.ok(p.resaleItemData.every((d) => d.quantity === 1 && d.movementIds.length === 1));
   assert.deepStrictEqual(AB.payloadMissing(p), []);
 });
 t('pairs with different prices become separate entries', () => {
   const c = AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5 }), siteItem({ mid: 2, seat: 6 }), siteItem({ mid: 3, seat: 20, row: '3', price: 700, cat: 502 }), siteItem({ mid: 4, seat: 21, row: '3', price: 700, cat: 502 })]));
   const p = AB.buildPayload(1, c.seats);
-  assert.strictEqual(p.resaleItemData.length, 2);
-  assert.deepStrictEqual(p.resaleItemData.map((d) => d.quantity), [2, 2]);
+  assert.strictEqual(p.resaleItemData.length, 4);
+  assert.deepStrictEqual(p.resaleItemData.map((d) => d.quantity), [1, 1, 1, 1]);
+  assert.deepStrictEqual(p.resaleItemData.map((d) => d.unitAmount), [450, 450, 700, 700]);
 });
 t('fixture-shaped listing is recognised as a pair but the request is reported incomplete, not sent', () => {
   const raw = JSON.parse(fs.readFileSync(__dirname + '/test-fixtures/items-hit.json', 'utf8'));
@@ -198,10 +202,13 @@ t('form body mirrors the match page fields and carries the csrf', () => {
   assert.ok(body.indexOf('resaleItemData%5B0%5D.key=NFF_RESALE_') > 0, 'form carries the row key: ' + body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.audienceSubCategoryId=10229709001571') > 0, 'form carries the Resale tariff: ' + body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.seatCategoryId=10229721164074') > 0, body);
-  assert.ok(body.indexOf('resaleItemData%5B0%5D.quantity=2') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.quantity=1') > 0, 'each seat is its own entry of quantity 1: ' + body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.unitAmount=690000') > 0, body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.movementIds%5B0%5D=111') > 0, body);
-  assert.ok(body.indexOf('resaleItemData%5B0%5D.movementIds%5B1%5D=112') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B1%5D.movementIds%5B0%5D=112') > 0, 'second seat is entry [1]: ' + body);
+  assert.ok(body.indexOf('resaleItemData%5B1%5D.quantity=1') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B1%5D.key=NFF_RESALE_') > 0, 'both entries carry the shared key: ' + body);
+  assert.strictEqual(body.indexOf('quantity=2'), -1, 'never a quantity-2 entry on the seated page');
   assert.ok(body.endsWith('_csrf=tok-123'), body);
 });
 t('two rows (different keys and prices) make two form entries', () => {
@@ -211,12 +218,13 @@ t('two rows (different keys and prices) make two form entries', () => {
     Object.assign(liveItem({ mid: 3, row: '9', seat: '20', key: 'NFF_RESALE_ROW_B' }), dear),
     Object.assign(liveItem({ mid: 4, row: '9', seat: '21', key: 'NFF_RESALE_ROW_B' }), dear)] }));
   const payload = AB.buildPayload(1, AB.choosePairs(seats).seats);
-  assert.strictEqual(payload.resaleItemData.length, 2);
+  assert.strictEqual(payload.resaleItemData.length, 4, 'two pairs = four seat entries');
   const body = AB.buildFormBody(payload, 'x');
-  assert.ok(body.indexOf('resaleItemData%5B1%5D.unitAmount=990000') > 0, body);
-  assert.ok(body.indexOf('resaleItemData%5B1%5D.key=NFF_RESALE_ROW_B') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B2%5D.unitAmount=990000') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B2%5D.key=NFF_RESALE_ROW_B') > 0, body);
+  assert.ok(body.indexOf('resaleItemData%5B3%5D.key=NFF_RESALE_ROW_B') > 0, body);
 });
-t('the real 17 Sep Portugal pair (one key, two seats) becomes ONE row with quantity 2 and both movement ids', () => {
+t('the real 17 Sep Portugal pair (one key, two seats) becomes TWO entries of quantity 1 sharing the key', () => {
   const k = 'NFF_RESALE_10229739619905_10229739913107_10229739620585_10229718202440_10229721214995_10229708951675_10229721164073_null';
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [
     Object.assign(liveItem({ mid: 10229796417629, row: '27', seat: '417', key: k, block: '411' }), { seatCategoryId: 10229721164073, realPrice: 890000, pricesSelection: [{ audienceSubCatId: 10229709001571, amount: 890000 }] }),
@@ -224,8 +232,9 @@ t('the real 17 Sep Portugal pair (one key, two seats) becomes ONE row with quant
   const c = AB.choosePairs(seats);
   assert.strictEqual(c.count, 2);
   const p = AB.buildPayload(10229739913107, c.seats);
-  assert.strictEqual(p.resaleItemData.length, 1);
-  assert.deepStrictEqual(p.resaleItemData[0], { key: k, audienceSubCategoryId: 10229709001571, seatCategoryId: 10229721164073, priceLevelId: null, quantity: 2, unitAmount: 890000, movementIds: [10229796417629, 10229796417630] });
+  assert.strictEqual(p.resaleItemData.length, 2);
+  assert.deepStrictEqual(p.resaleItemData[0], { key: k, audienceSubCategoryId: 10229709001571, seatCategoryId: 10229721164073, priceLevelId: null, quantity: 1, unitAmount: 890000, movementIds: [10229796417629] });
+  assert.deepStrictEqual(p.resaleItemData[1], { key: k, audienceSubCategoryId: 10229709001571, seatCategoryId: 10229721164073, priceLevelId: null, quantity: 1, unitAmount: 890000, movementIds: [10229796417630] });
   assert.deepStrictEqual(AB.payloadMissing(p), []);
 });
 t('the form body carries priceLevelId (empty when null) and key, matching the page addToCart', () => {

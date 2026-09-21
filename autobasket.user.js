@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.2.4
+// @version      0.2.5
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.2.4',
+    VERSION: '0.2.5',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -246,25 +246,20 @@
   };
 
   // ---- basket request --------------------------------------------------------------
-  // One resaleItemData entry per listing ROW, exactly as the page's own form posts it.
-  // Rows are identified by the listing's `key` (both seats of the 17 Sep Portugal pair
-  // shared one key: one row, quantity 2, two movementIds). Without a key we fall back
-  // to grouping by tariff/category/price.
+  // One resaleItemData entry PER SEAT, exactly as the seated page's own form posts it.
+  // The resaleItems.json module (stx2js 1642) keeps every JSON row as its own model
+  // (enhencingItems without isTicketsGrouped) and addToCart emits one entry per row with
+  // orderQuantity 1, so a pair is TWO entries of quantity 1 sharing the same key. Sending
+  // one entry with quantity 2 was rejected back to the item page (18 and 21 Sep).
   AB.buildPayload = function (performanceId, seats) {
-    var groups = {}, order = [];
-    seats.forEach(function (s) {
-      var it = s.item, key = it.key || [it.audienceSubCategoryId, it.seatCategoryId, it.price].join('|');
-      if (!groups[key]) {
-        groups[key] = { key: it.key !== undefined ? it.key : null, audienceSubCategoryId: it.audienceSubCategoryId,
-                        seatCategoryId: it.seatCategoryId, priceLevelId: it.priceLevelId !== undefined ? it.priceLevelId : null,
-                        quantity: 0, unitAmount: it.price, movementIds: [] };
-        order.push(key);
-      }
-      groups[key].quantity += 1;
-      groups[key].movementIds.push(s.movementId);
+    var rows = seats.map(function (s) {
+      var it = s.item;
+      return { key: it.key !== undefined ? it.key : null, audienceSubCategoryId: it.audienceSubCategoryId,
+               seatCategoryId: it.seatCategoryId, priceLevelId: it.priceLevelId !== undefined ? it.priceLevelId : null,
+               quantity: 1, unitAmount: it.price, movementIds: [s.movementId] };
     });
     var pid = Number(performanceId);
-    return { performanceId: isNaN(pid) ? performanceId : pid, resaleItemData: order.map(function (k) { return groups[k]; }) };
+    return { performanceId: isNaN(pid) ? performanceId : pid, resaleItemData: rows };
   };
   AB.payloadMissing = function (payload) {
     var missing = {};
