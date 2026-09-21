@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.2.5
+// @version      0.2.6
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.2.5',
+    VERSION: '0.2.6',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -47,6 +47,7 @@
     WINDOW_MS: 15 * 60 * 1000,    // keep chasing the same seats at most this long
     MAX_TRIES: 25,                // ...and at most this many navigations
     BACKOFF_MS: 4000,             // wait this long between attempts on the same seats
+    REAPPEAR_MS: 45 * 1000,       // the same seats unseen this long, then back = a re-release: fresh window and tries
     INTENT_TTL_MS: 3 * 60 * 1000, // a stored grab intent older than this is stale
     STALE_MS: 2 * 60 * 1000,      // ntfy alerts older than this are ignored
     KEEPALIVE_MS: 10 * 60 * 1000, // light request so the login does not time out
@@ -535,10 +536,26 @@
     });
     return chain.then(function () { render(); if (found) act(found); });
   }
+  // The grab record caps attempts on one seat-set. Two lessons from 21 Sep: (1) the same
+  // seats bounce back every ~15 min when a hold expires, and a window anchored to the
+  // FIRST sighting had expired by then, so the re-release was refused with a stale try
+  // count from the old payload; now a seat-set unseen for REAPPEAR_MS and back again gets
+  // a fresh window and fresh tries. (2) giving up used to be silent; now it alarms and
+  // pushes "buy by hand" once, because the seats are still listed at that moment.
   function canTry(target) {
     var now = Date.now(), grab = getJSON('grab');
-    if (!grab || grab.key !== target.key) { grab = { key: target.key, tries: 0, since: now, nextTryAt: 0 }; setJSON('grab', grab); }
-    if (grab.tries >= AB.MAX_TRIES || (now - grab.since) > AB.WINDOW_MS) { setAction('gave up ' + target.name + ' after ' + grab.tries + ' tries this window'); return false; }
+    var fresh = !grab || grab.key !== target.key || (grab.lastSeen && now - grab.lastSeen > AB.REAPPEAR_MS);
+    if (fresh) grab = { key: target.key, tries: 0, since: now, nextTryAt: 0, gaveUp: false };
+    grab.lastSeen = now; setJSON('grab', grab);
+    if (grab.tries >= AB.MAX_TRIES || (now - grab.since) > AB.WINDOW_MS) {
+      if (!grab.gaveUp) {
+        grab.gaveUp = true; setJSON('grab', grab);
+        setAction('GAVE UP ' + target.name + ' after ' + grab.tries + ' tries - BUY BY HAND NOW');
+        alarm();
+        push('urgent', AB.OWN_TITLE_PREFIX + ' GAVE UP', target.desc + ': ' + grab.tries + ' tries failed this window and the seats are STILL LISTED. Buy by hand now.', AB.matchPage(target.id));
+      }
+      return false;
+    }
     if (grab.nextTryAt && now < grab.nextTryAt) return false;
     return true;
   }
