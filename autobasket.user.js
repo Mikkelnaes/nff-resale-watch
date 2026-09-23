@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.4.0
+// @version      0.4.1
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.4.0',
+    VERSION: '0.4.1',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -363,6 +363,10 @@
   };
   function hhmm(t) { var d = t ? new Date(t) : new Date(); return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2); }
   function log(s) { try { win.console.log('[auto-basket ' + hhmm() + '] ' + s); } catch (e) { /* ignore */ } }
+  // Step trace for one grab attempt; it rides along in every miss push so a failure says
+  // exactly where it stopped (23 Sep: a bare "shop refused" told us nothing).
+  function tr(s) { var t = getJSON('trace') || []; t.push(hhmm() + ' ' + s); if (t.length > 40) t = t.slice(-40); setJSON('trace', t); log(s); }
+  function traceText() { var t = getJSON('trace') || []; return t.length ? ' | trace: ' + t.join(' > ') : ''; }
   function setAction(s) { state.lastAction = hhmm() + ' ' + s; log(s); render(); }
   function untilMs(key) { var t = Number(store.get(key, '0')); return t > Date.now() ? t - Date.now() : 0; }
   function pageMode() { return AB.pageMode(win.location.pathname, doc.title); }
@@ -597,6 +601,7 @@
     });
     setJSON('intent', { pid: target.id, name: target.name, key: target.key, desc: target.desc, queue: [target.payload], got: [], total: 1,
                         seats: seatSpecs, test: !!target.test, createdAt: Date.now(), status: 'go' });
+    store.del('trace'); tr('grab ' + target.desc + ' (' + seatSpecs.map(function (s) { return s.area + ' r' + s.row + ' s' + s.seatNo; }).join(', ') + ') block ' + seatSpecs[0].blockId);
     setAction((target.test ? 'TEST: ' : '') + 'grabbing ' + target.desc + ' -> entering the queue');
     win.setTimeout(function () { win.location.href = AB.matchPage(target.id); }, 50);
   }
@@ -660,42 +665,60 @@
   function driveSeatMap(intent, payload) {
     var specs = intent.seats || [];
     if (!specs.length) return Promise.resolve(false);
+    tr('item page ' + win.location.pathname + ' mode=' + pageMode());
     return waitFor(seatMapReady, AB.SEATMAP_WAIT_MS, 200).then(function (ok) {
-      if (!ok) { log('seat map not ready'); return false; }
+      if (!ok) { tr('seat map NOT ready after ' + AB.SEATMAP_WAIT_MS + ' ms (SeatMap=' + !!win.SeatMap + ' SeatList=' + !!win.SeatList + ' seatsLayer=' + !!(win.SeatMap && win.SeatMap.seatsLayer) + ')'); return false; }
       var SM = win.SeatMap, SL = win.SeatList;
+      tr('seat map ready, features=' + ((SM.seatsLayer.features || []).length) + ' resaleMode=' + (SL.isResaleMode && SL.isResaleMode()));
       var bid = specs[0].blockId;
-      if (bid !== undefined && bid !== null) {
-        try { SM.zoomToBlockOrArea(Number(bid)); } catch (e1) { try { SM.zoomToBlockOrArea(String(bid)); } catch (e2) { log('zoom failed: ' + e2); } }
+      if (bid !== undefined && bid !== null) {   // zoom both ways: block ids may be numbers or strings
+        try { SM.zoomToBlockOrArea(Number(bid)); } catch (e1) { /* ignore */ }
+        try { SM.zoomToBlockOrArea(String(bid)); } catch (e2) { /* ignore */ }
+        tr('zoomed to block ' + bid);
       }
       return waitFor(function () {
         return !(SM.isFreeSeatsCallsInProgress && SM.isFreeSeatsCallsInProgress()) && findSeatFeatures(specs).length === specs.length;
       }, AB.SEATS_WAIT_MS, 200).then(function () {
-        var hits = findSeatFeatures(specs);
-        if (hits.length !== specs.length) { log('seats found on map: ' + hits.length + '/' + specs.length); return false; }
+        var hits = findSeatFeatures(specs), feats = (SM.seatsLayer.features || []);
+        tr('seats found ' + hits.length + '/' + specs.length + ' among ' + feats.length + ' features' + (hits.length ? '' : ' (sample: ' + JSON.stringify((feats[0] && feats[0].data && { id: feats[0].data.id, block: feats[0].data.block, row: feats[0].data.row, number: feats[0].data.number, hasResaleSeats: !!feats[0].data.resaleSeats }) || null) + ')'));
+        if (hits.length !== specs.length) return false;
         var before = SL.getNbSelectedSeats() || 0;
         return hits.reduce(function (p, h) {
           return p.then(function () {
             var fid = parseInt(h.feature.fid, 10);
             if (isNaN(fid)) fid = parseInt(h.feature.data && h.feature.data.id, 10);
             var n0 = SL.getNbSelectedSeats() || 0;
-            try { SM.selectSeat(fid, false, true); } catch (e) { log('selectSeat failed: ' + e); }
-            return waitFor(function () { return (SL.getNbSelectedSeats() || 0) > n0; }, 1500, 100).then(function (added) {
-              if (added) return;
-              // the map click did not auto-add (details-popup mode): add through the page's own addSeat
+            try { SM.selectSeat(fid, false, true); tr('selectSeat(' + fid + ')'); } catch (e) { tr('selectSeat failed: ' + e); }
+            // In resale mode a map click does NOT auto-add: the details box shows its own
+            // "add" button (#add-selected-seat-to-cart) which a human clicks. Wait for it, click it.
+            return waitFor(function () {
+              if ((SL.getNbSelectedSeats() || 0) > n0) return true;
+              var b = doc.getElementById('add-selected-seat-to-cart');
+              return !!(b && b.parentElement && !/\bdisabled\b/.test(b.parentElement.className || ''));
+            }, 2500, 100).then(function (ready) {
+              if ((SL.getNbSelectedSeats() || 0) > n0) { tr('seat auto-added'); return; }
+              var b = doc.getElementById('add-selected-seat-to-cart');
+              if (ready && b) {
+                try { b.click(); tr('clicked #add-selected-seat-to-cart'); } catch (e6) { tr('details add click failed: ' + e6); }
+                return waitFor(function () { return (SL.getNbSelectedSeats() || 0) > n0; }, 2000, 100).then(function (ok2) { tr(ok2 ? 'seat added via details box' : 'details add did not register'); });
+              }
+              tr('no details add button; trying SeatList.addSeat directly');
               try {
-                var d = Object.assign({}, h.feature.data, h.offer, { resaleInfo: h.offer.resaleInfo, seatId: h.offer.resaleInfo.resaleMovId });
+                var off = h.offer || {};
+                var ri = off.resaleInfo || { resaleMovId: h.spec.mid };
+                var d = Object.assign({}, h.feature.data, off, { resaleInfo: ri, seatId: ri.resaleMovId });
                 if (!d.prices || !d.prices.length) {
                   var r0 = payload.resaleItemData[0] || {};
                   d.prices = [{ amount: r0.unitAmount, audienceSubCategoryId: r0.audienceSubCategoryId, priceLevelId: null }];
                 }
-                SL.addSeat({ data: d, priceIdx: 0 });
-              } catch (e3) { log('addSeat failed: ' + e3); }
+                SL.addSeat({ data: d, priceIdx: 0 }); tr('addSeat direct -> count ' + SL.getNbSelectedSeats());
+              } catch (e3) { tr('addSeat failed: ' + e3); }
             });
           });
         }, Promise.resolve()).then(function () {
           var n = (SL.getNbSelectedSeats() || 0) - before;
+          tr('selected ' + n + '/' + specs.length);
           if (n < specs.length) {
-            log('only ' + n + ' of ' + specs.length + ' seats selected on the map');
             try { if (SM.unselectAllSeats) SM.unselectAllSeats(); } catch (e4) { /* ignore */ }
             return false;
           }
@@ -704,8 +727,9 @@
           setAction('seat map: ' + specs.length + ' seat(s) selected, pressing the page\'s own Add to cart');
           var btn = doc.getElementById('add-to-cart');
           var disabled = !!(btn && btn.parentElement && /\bdisabled\b/.test(btn.parentElement.className || ''));
-          try { if (btn && !disabled) btn.click(); else SL.completeAndSubmitResaleForm(); }
-          catch (e5) { log('seat-map submit failed: ' + e5); return false; }
+          tr('add-to-cart button ' + (btn ? (disabled ? 'present but disabled' : 'enabled') : 'missing') + ', canBook=' + (SL.canBook ? SL.canBook() : '?'));
+          try { if (btn && !disabled) btn.click(); else SL.completeAndSubmitResaleForm(); tr('submitted via page'); }
+          catch (e5) { tr('seat-map submit failed: ' + e5); return false; }
           win.setTimeout(function () {   // no navigation? the page did not submit: our own form
             if (pageMode() === 'item') { setAction('seat-map add did not navigate, falling back to own form'); submitRealForm(payload, csrfFrom(doc.documentElement.innerHTML), intent, intent.desc + ' [own form after seat map]'); }
           }, 4000);
@@ -757,10 +781,21 @@
     } catch (e) { log('driveRealUI failed: ' + e); return false; }
   }
   function submitRealForm(payload, csrf, intent, desc) {
+    var form = doc.getElementById(AB.FORM_ID);
+    if (!form) {   // the seat-map page renders the form a little later: give it 3 s before the last resort
+      return waitFor(function () { return !!doc.getElementById(AB.FORM_ID); }, 3000, 150).then(function (ok) {
+        tr(ok ? 'form appeared late' : 'form #' + AB.FORM_ID + ' never appeared -> background POST (known to be bounced)');
+        return submitRealFormNow(payload, csrf, intent, desc);
+      });
+    }
+    return submitRealFormNow(payload, csrf, intent, desc);
+  }
+  function submitRealFormNow(payload, csrf, intent, desc) {
     intent.status = 'submitting'; intent.desc = desc; setJSON('intent', intent);
     if (intent.test) { store.del('testOnce'); state.testOnce = false; }   // one shot: consumed the moment we actually send
     var form = doc.getElementById(AB.FORM_ID);
     if (!form) { return submitBg(payload, csrf, intent, desc); }
+    tr('own form submit (' + (payload.resaleItemData || []).length + ' rows)');
     Array.prototype.slice.call(form.querySelectorAll('input[name^="resaleItemData"], input[name="performanceId"]'))
       .forEach(function (n) { n.parentNode.removeChild(n); });
     function add(name, val) { var i = doc.createElement('input'); i.type = 'hidden'; i.name = name; i.value = (val === undefined || val === null ? '' : val); form.appendChild(i); }
@@ -852,6 +887,7 @@
     store.del('intent'); state.busy = false;
     var test = !!(intent && intent.test);
     if (test) { store.del('testOnce'); state.testOnce = false; }   // one shot, even on a miss: we have the diagnostic now
+    reason = reason + traceText(); store.del('trace');   // every miss carries the step trace
     setAction((test ? 'TEST miss: ' : 'miss: ') + reason + ' -> back to watching');
     push(test ? 'urgent' : 'default', AB.OWN_TITLE_PREFIX + (test ? ' TEST FAILED' : ' miss'),
       (intent && intent.name || '') + ': ' + reason + (test ? ' (test mode off; send this to Claude)' : '. Still watching.'), intent && AB.matchPage(intent.pid));
