@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.3.0
+// @version      0.3.1
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.3.0',
+    VERSION: '0.3.1',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -291,8 +291,10 @@
       parts.push([p + 'seatCategoryId', d.seatCategoryId]);
       parts.push([p + 'quantity', d.quantity]);
       parts.push([p + 'unitAmount', d.unitAmount]);
-      parts.push([p + 'key', d.key]);
-      parts.push([p + 'priceLevelId', d.priceLevelId]);
+      if (d.key !== undefined && d.key !== null) parts.push([p + 'key', d.key]);
+      // Only when the listing gives a real priceLevelId. The one submit proven to work
+      // (17 Sep single) carried no priceLevelId field; an empty one is an untested difference.
+      if (d.priceLevelId !== undefined && d.priceLevelId !== null && d.priceLevelId !== '') parts.push([p + 'priceLevelId', d.priceLevelId]);
       (d.movementIds || []).forEach(function (mid, j) { parts.push([p + 'movementIds[' + j + ']', mid]); });
     });
     if (csrf) parts.push(['_csrf', csrf]);
@@ -620,8 +622,8 @@
       add(p + 'seatCategoryId', d.seatCategoryId);
       add(p + 'quantity', d.quantity);
       add(p + 'unitAmount', d.unitAmount);
-      add(p + 'key', d.key);
-      add(p + 'priceLevelId', d.priceLevelId);
+      if (d.key !== undefined && d.key !== null) add(p + 'key', d.key);
+      if (d.priceLevelId !== undefined && d.priceLevelId !== null && d.priceLevelId !== '') add(p + 'priceLevelId', d.priceLevelId);
       (d.movementIds || []).forEach(function (mid, j) { add(p + 'movementIds[' + j + ']', mid); });
     });
     if (csrf && !form.querySelector('input[name="_csrf"]')) add('_csrf', csrf);

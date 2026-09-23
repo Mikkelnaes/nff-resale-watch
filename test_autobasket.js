@@ -237,19 +237,21 @@ t('the real 17 Sep Portugal pair (one key, two seats) becomes TWO entries of qua
   assert.deepStrictEqual(p.resaleItemData[1], { key: k, audienceSubCategoryId: 10229709001571, seatCategoryId: 10229721164073, priceLevelId: null, quantity: 1, unitAmount: 890000, movementIds: [10229796417630] });
   assert.deepStrictEqual(AB.payloadMissing(p), []);
 });
-t('the form body carries priceLevelId (empty when null) and key, matching the page addToCart', () => {
+t('a null priceLevelId is OMITTED from the form (the proven 17 Sep single carried none), key is kept', () => {
   const k = 'NFF_RESALE_ROW_X';
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [
     liveItem({ mid: 1, row: '5', seat: '10', key: k }), liveItem({ mid: 2, row: '5', seat: '11', key: k })] }));
   const body = AB.buildFormBody(AB.buildPayload(1, AB.choosePairs(seats).seats), 'tok');
-  assert.ok(body.indexOf('resaleItemData%5B0%5D.priceLevelId=&') > 0 || body.indexOf('resaleItemData%5B0%5D.priceLevelId=') > 0, 'priceLevelId field present: ' + body);
+  assert.strictEqual(body.indexOf('priceLevelId'), -1, 'no empty priceLevelId field: ' + body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.key=NFF_RESALE_ROW_X') > 0, body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.seatCategoryId=') > 0, body);
 });
-t('a non-null priceLevelId is carried through', () => {
+t('a non-null priceLevelId is carried through and posted', () => {
   const it = AB.normalizeItems({ resaleItems: [liveItem({ mid: 1, row: '5', seat: '10', plId: 777 })] })[0];
   assert.strictEqual(it.priceLevelId, 777);
-  assert.strictEqual(AB.buildPayload(1, AB.expandSeats([]).concat()).resaleItemData.length, 0);
+  const body = AB.buildFormBody(AB.buildPayload(1, AB.expandSeats([it])), 'tok');
+  assert.ok(body.indexOf('resaleItemData%5B0%5D.priceLevelId=777') > 0, body);
+  assert.strictEqual(AB.buildPayload(1, []).resaleItemData.length, 0);
 });
 console.log('# one-off smoke test chooser (reserve 1 ticket to prove the submit path)');
 t('chooseAny picks one ticket with an id, numbered seats first', () => {
