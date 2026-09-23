@@ -163,6 +163,18 @@ t('unnumbered tickets are never taken', () => {
 });
 t('duplicate listing of the same seat does not form a pair with itself', () => assert.strictEqual(AB.choosePairs(S(5, 5)), null));
 t('a want list of [2] takes one pair even when four are there', () => assert.strictEqual(AB.choosePairs(S(5, 6, 7, 8), [2]).count, 2));
+t('ignored movement ids (known unbuyable listing) are never chosen', () => {
+  const old = AB.IGNORE_MOVEMENTS; AB.IGNORE_MOVEMENTS = ['100', '101'];
+  try {
+    assert.strictEqual(AB.choosePairs(S(5, 6)), null, 'the ignored pair itself');
+    const c = AB.choosePairs(S(5, 6, 7, 8));
+    assert.strictEqual(c.count, 2, 'the remaining two seats still form a pair');
+    assert.deepStrictEqual(nos(c), [7, 8]);
+  } finally { AB.IGNORE_MOVEMENTS = old; }
+});
+t('the real ghost pair is on the ignore list', () => {
+  assert.ok(AB.IGNORE_MOVEMENTS.indexOf('10229785497024') >= 0 && AB.IGNORE_MOVEMENTS.indexOf('10229785497025') >= 0);
+});
 t('excluded sections are skipped', () => {
   const old = AB.EXCLUDE_AREA; AB.EXCLUDE_AREA = /^B7$/;
   try { assert.strictEqual(AB.choosePairs(S(5, 6)), null); } finally { AB.EXCLUDE_AREA = old; }

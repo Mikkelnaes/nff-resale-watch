@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.3.2
+// @version      0.4.0
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,11 +36,14 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.3.2',
+    VERSION: '0.4.0',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
     EXCLUDE_AREA: null,           // e.g. /^(10[7-9]|11[0-2]|40[7-9]|41[0-4])$/ to skip the away blocks; null = any section
+    IGNORE_MOVEMENTS: ['10229785497024', '10229785497025'],   // the 23 Sep "ghost" Denmark pair nobody can buy (bounced all day; manual add from 2 devices failed)
+    SEATMAP_WAIT_MS: 8000,        // wait for the seat map (SeatMap/SeatList) to initialise on the match page
+    SEATS_WAIT_MS: 10000,         // wait for our seats to be loaded into the map after zooming to the block
     POLL_MS: 3000,                // in-browser listing poll interval
     COOLDOWN_MS: 20 * 60 * 1000,  // after a reservation: ignore everything this long (basket hold ~15 min)
     TEST_COOLDOWN_MS: 90 * 1000,  // after the one-off smoke test: short, so a real pair is not missed
@@ -158,6 +161,9 @@
       var plId = ps && ('priceLevelId' in ps) ? ps.priceLevelId : pick(it, ['priceLevelId']);
       return {
         key: pick(it, ['key']),   // the row identity the form posts as resaleItemData[i].key
+        blockId: pick(it, ['blockId']),           // seat-map block to zoom to
+        areaId: pick(it, ['areaId']),
+        ticketResaleId: pick(it, ['ticketResaleId']),
         movementIds: mids,
         seatCategoryId: pick(it, ['seatCategoryId', 'seatCategory.id', 'seatCatId', 'categoryId']),
         priceLevelId: plId === undefined ? null : plId,
@@ -203,6 +209,7 @@
     seats.forEach(function (s) {
       if (s.movementId === undefined || s.seatNo === null || s.area === null || s.row === null) return;
       if (AB.EXCLUDE_AREA && AB.EXCLUDE_AREA.test(s.area)) return;
+      if (AB.IGNORE_MOVEMENTS && AB.IGNORE_MOVEMENTS.indexOf(String(s.movementId)) >= 0) return;   // known unbuyable listing
       var g = s.area + '' + s.row;
       (groups[g] = groups[g] || []).push(s);
     });
@@ -582,11 +589,14 @@
     }
     if (!canTry(target)) return;
     state.busy = true;
-    // The seats travel with the intent as a QUEUE of single-seat payloads: the match page
-    // submits one, lands in the cart, comes back for the next, until the queue is empty.
-    var queue = AB.singlePayloads(target.id, target.choice.seats);
-    setJSON('intent', { pid: target.id, name: target.name, key: target.key, desc: target.desc, queue: queue, got: [], total: queue.length,
-                        test: !!target.test, createdAt: Date.now(), status: 'go' });
+    // ALL seats go in ONE submit (the seat map's own way; one-at-a-time is rejected by the
+    // "no orphan seat" rule). The intent carries the payload plus what the seat map needs to
+    // find each seat: movement id, row, seat number, block name and block id.
+    var seatSpecs = target.choice.seats.map(function (s) {
+      return { mid: s.movementId, row: s.row, seatNo: s.seatNo, area: s.area, blockId: s.item.blockId !== undefined ? s.item.blockId : null };
+    });
+    setJSON('intent', { pid: target.id, name: target.name, key: target.key, desc: target.desc, queue: [target.payload], got: [], total: 1,
+                        seats: seatSpecs, test: !!target.test, createdAt: Date.now(), status: 'go' });
     setAction((target.test ? 'TEST: ' : '') + 'grabbing ' + target.desc + ' -> entering the queue');
     win.setTimeout(function () { win.location.href = AB.matchPage(target.id); }, 50);
   }
@@ -605,14 +615,103 @@
     intent.got = intent.got || []; intent.total = intent.total || (queue.length + intent.got.length);
     if (!queue.length) { store.del('intent'); return; }
     intent.queue = queue; intent.current = queue[0];
-    var payload = queue[0];
-    setAction('through the queue on ' + intent.name + ', adding seat ' + (intent.got.length + 1) + '/' + intent.total);
-    // Preferred: drive the page's OWN select + add-to-cart (resale.singleEntry.item), so the
-    // request is exactly what a human click sends, built from the page's own model.
-    // Fallback if the page UI is not ready within 6 s: our own form.
-    waitFor(function () { return pageUiReady(payload); }, 6000, 150).then(function (ready) {
-      if (ready && driveRealUI(payload, intent)) return;
-      submitRealForm(payload, csrf, intent, intent.desc);
+    var payload = queue[0], nSeats = (payload.resaleItemData || []).length;
+    setAction('through the queue on ' + intent.name + ', selecting ' + nSeats + ' seat(s) on the seat map');
+    // 1) SEAT MAP, exactly like a human: zoom to the block, "click" each of our seats through the
+    //    map's own select control (the page's handler adds it to the selection), then press the
+    //    page's own Add to cart (SeatList.completeAndSubmitResaleForm) which posts ALL seats in
+    //    one submit - the only way a pair is accepted (no-orphan-seat rule).
+    // 2) Single seat only: the list module's selectItem + addToCart.
+    // 3) Our own form with all seats (same row shape the seat map posts).
+    driveSeatMap(intent, payload).then(function (done) {
+      if (done) return;
+      if (nSeats === 1) {
+        return waitFor(function () { return pageUiReady(payload); }, 3000, 150).then(function (ready) {
+          if (ready && driveRealUI(payload, intent)) return;
+          submitRealForm(payload, csrf, intent, intent.desc + ' [own form]');
+        });
+      }
+      submitRealForm(payload, csrf, intent, intent.desc + ' [own form]');
+    });
+  }
+  // ---- seat map driving --------------------------------------------------------------
+  function seatMapReady() {
+    var SM = win.SeatMap, SL = win.SeatList;
+    return !!(SM && SL && SM.map && SM.seatsLayer && typeof SM.selectSeat === 'function' &&
+              typeof SL.completeAndSubmitResaleForm === 'function' && typeof SL.getNbSelectedSeats === 'function');
+  }
+  function offerFor(f, mid) {   // the resale offer on a seat feature that matches our movement id
+    var rs = (f && f.data && f.data.resaleSeats) || [];
+    for (var i = 0; i < rs.length; i++) { var ri = rs[i] && rs[i].resaleInfo; if (ri && String(ri.resaleMovId) === String(mid)) return rs[i]; }
+    return null;
+  }
+  function findSeatFeatures(specs) {   // -> one {spec, feature, offer} per spec found in the loaded map features
+    var feats = (win.SeatMap && win.SeatMap.seatsLayer && win.SeatMap.seatsLayer.features) || [], out = [];
+    specs.forEach(function (sp) {
+      for (var i = 0; i < feats.length; i++) {
+        var f = feats[i], off = offerFor(f, sp.mid), d = f && f.data;
+        if (!off && d && sp.seatNo !== null && String(d.number) === String(sp.seatNo) && String(d.row) === String(sp.row) &&
+            (!sp.area || String(d.block) === String(sp.area))) off = (d.resaleSeats && d.resaleSeats[0]) || null;
+        if (off) { out.push({ spec: sp, feature: f, offer: off }); break; }
+      }
+    });
+    return out;
+  }
+  function driveSeatMap(intent, payload) {
+    var specs = intent.seats || [];
+    if (!specs.length) return Promise.resolve(false);
+    return waitFor(seatMapReady, AB.SEATMAP_WAIT_MS, 200).then(function (ok) {
+      if (!ok) { log('seat map not ready'); return false; }
+      var SM = win.SeatMap, SL = win.SeatList;
+      var bid = specs[0].blockId;
+      if (bid !== undefined && bid !== null) {
+        try { SM.zoomToBlockOrArea(Number(bid)); } catch (e1) { try { SM.zoomToBlockOrArea(String(bid)); } catch (e2) { log('zoom failed: ' + e2); } }
+      }
+      return waitFor(function () {
+        return !(SM.isFreeSeatsCallsInProgress && SM.isFreeSeatsCallsInProgress()) && findSeatFeatures(specs).length === specs.length;
+      }, AB.SEATS_WAIT_MS, 200).then(function () {
+        var hits = findSeatFeatures(specs);
+        if (hits.length !== specs.length) { log('seats found on map: ' + hits.length + '/' + specs.length); return false; }
+        var before = SL.getNbSelectedSeats() || 0;
+        return hits.reduce(function (p, h) {
+          return p.then(function () {
+            var fid = parseInt(h.feature.fid, 10);
+            if (isNaN(fid)) fid = parseInt(h.feature.data && h.feature.data.id, 10);
+            var n0 = SL.getNbSelectedSeats() || 0;
+            try { SM.selectSeat(fid, false, true); } catch (e) { log('selectSeat failed: ' + e); }
+            return waitFor(function () { return (SL.getNbSelectedSeats() || 0) > n0; }, 1500, 100).then(function (added) {
+              if (added) return;
+              // the map click did not auto-add (details-popup mode): add through the page's own addSeat
+              try {
+                var d = Object.assign({}, h.feature.data, h.offer, { resaleInfo: h.offer.resaleInfo, seatId: h.offer.resaleInfo.resaleMovId });
+                if (!d.prices || !d.prices.length) {
+                  var r0 = payload.resaleItemData[0] || {};
+                  d.prices = [{ amount: r0.unitAmount, audienceSubCategoryId: r0.audienceSubCategoryId, priceLevelId: null }];
+                }
+                SL.addSeat({ data: d, priceIdx: 0 });
+              } catch (e3) { log('addSeat failed: ' + e3); }
+            });
+          });
+        }, Promise.resolve()).then(function () {
+          var n = (SL.getNbSelectedSeats() || 0) - before;
+          if (n < specs.length) {
+            log('only ' + n + ' of ' + specs.length + ' seats selected on the map');
+            try { if (SM.unselectAllSeats) SM.unselectAllSeats(); } catch (e4) { /* ignore */ }
+            return false;
+          }
+          intent.status = 'submitting'; intent.current = payload; setJSON('intent', intent);
+          if (intent.test) { store.del('testOnce'); state.testOnce = false; }
+          setAction('seat map: ' + specs.length + ' seat(s) selected, pressing the page\'s own Add to cart');
+          var btn = doc.getElementById('add-to-cart');
+          var disabled = !!(btn && btn.parentElement && /\bdisabled\b/.test(btn.parentElement.className || ''));
+          try { if (btn && !disabled) btn.click(); else SL.completeAndSubmitResaleForm(); }
+          catch (e5) { log('seat-map submit failed: ' + e5); return false; }
+          win.setTimeout(function () {   // no navigation? the page did not submit: our own form
+            if (pageMode() === 'item') { setAction('seat-map add did not navigate, falling back to own form'); submitRealForm(payload, csrfFrom(doc.documentElement.innerHTML), intent, intent.desc + ' [own form after seat map]'); }
+          }, 4000);
+          return true;
+        });
+      });
     });
   }
   function waitFor(cond, timeoutMs, stepMs) {
@@ -730,7 +829,7 @@
     setAction('PARTIAL: ' + n + ' of ' + tot + ' seats in the cart; the rest failed');
     alarm();
     push('urgent', AB.OWN_TITLE_PREFIX + ': PARTIAL ' + n + '/' + tot, intent.desc + ': ' + n + ' of ' + tot + ' seats are in your cart, the rest failed (' + reason.slice(0, 120) + '). Decide now: pay for ' + n + ' or empty the cart.', AB.BASKET_PATH);
-    win.setTimeout(function () { win.location.href = AB.BASKET_PATH; }, 300);
+    win.setTimeout(function () { win.location.href = AB.BASKET_PATH; }, 1500);
   }
   function succeed(desc, redirect, test) {
     store.del('grab'); store.del('intent'); state.busy = false;
@@ -746,7 +845,7 @@
       alarm();
       push('urgent', AB.OWN_TITLE_PREFIX + ': RESERVED', 'RESERVED ' + desc + '. Pay NOW on the laptop, the basket hold is about 15 minutes.', AB.BASKET_PATH);
     }
-    win.setTimeout(function () { win.location.href = redirect || AB.BASKET_PATH; }, 300);
+    win.setTimeout(function () { win.location.href = redirect || AB.BASKET_PATH; }, 1500);   // let the RESERVED push leave first
   }
   function failGrab(intent, reason) {
     var grab = getJSON('grab'); if (grab) { grab.tries = (grab.tries || 0) + 1; grab.nextTryAt = Date.now() + AB.BACKOFF_MS; setJSON('grab', grab); }
@@ -756,7 +855,7 @@
     setAction((test ? 'TEST miss: ' : 'miss: ') + reason + ' -> back to watching');
     push(test ? 'urgent' : 'default', AB.OWN_TITLE_PREFIX + (test ? ' TEST FAILED' : ' miss'),
       (intent && intent.name || '') + ': ' + reason + (test ? ' (test mode off; send this to Claude)' : '. Still watching.'), intent && AB.matchPage(intent.pid));
-    win.setTimeout(function () { if (pageMode() !== 'list') win.location.href = AB.LIST_PATH; }, 500);
+    win.setTimeout(function () { if (pageMode() !== 'list') win.location.href = AB.LIST_PATH; }, 1500);   // let the push leave before navigating
   }
 
   function keepalive() {
