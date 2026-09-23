@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.3.1
+// @version      0.3.2
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.3.1',
+    VERSION: '0.3.2',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -452,6 +452,7 @@
   // ---- ntfy (phone push out + secondary trigger in) ------------------------------
   function push(priority, title, message, click) {
     if (!state.topic) return Promise.resolve();
+    message = '[v' + AB.VERSION + '] ' + message;   // so the phone log shows which version acted
     var headers = { 'Title': title, 'Priority': priority, 'Tags': 'shopping_cart,soccer' };
     if (click) headers['Click'] = /^https?:/.test(click) ? click : 'https://resale.fotball.no' + click;
     return win.fetch('https://ntfy.sh/' + encodeURIComponent(state.topic), { method: 'POST', headers: headers, body: message })
@@ -604,8 +605,57 @@
     intent.got = intent.got || []; intent.total = intent.total || (queue.length + intent.got.length);
     if (!queue.length) { store.del('intent'); return; }
     intent.queue = queue; intent.current = queue[0];
+    var payload = queue[0];
     setAction('through the queue on ' + intent.name + ', adding seat ' + (intent.got.length + 1) + '/' + intent.total);
-    submitRealForm(queue[0], csrf, intent, intent.desc);
+    // Preferred: drive the page's OWN select + add-to-cart (resale.singleEntry.item), so the
+    // request is exactly what a human click sends, built from the page's own model.
+    // Fallback if the page UI is not ready within 6 s: our own form.
+    waitFor(function () { return pageUiReady(payload); }, 6000, 150).then(function (ready) {
+      if (ready && driveRealUI(payload, intent)) return;
+      submitRealForm(payload, csrf, intent, intent.desc);
+    });
+  }
+  function waitFor(cond, timeoutMs, stepMs) {
+    return new Promise(function (resolve) {
+      var t0 = Date.now();
+      (function tick() {
+        var ok = false; try { ok = cond(); } catch (e) { ok = false; }
+        if (ok) return resolve(true);
+        if (Date.now() - t0 > timeoutMs) return resolve(false);
+        win.setTimeout(tick, stepMs);
+      })();
+    });
+  }
+  function pageModule() {
+    var r = win.resale;
+    return (r && r.singleEntry && r.singleEntry.item && typeof r.singleEntry.item.addToCart === 'function') ? r.singleEntry.item : null;
+  }
+  function rowFor(payload) {   // the page renders each seat row as <tr id="{{key}}">
+    var key = payload && payload.resaleItemData && payload.resaleItemData[0] && payload.resaleItemData[0].key;
+    if (key === undefined || key === null) return null;
+    return doc.querySelector('tr[id="' + String(key).replace(/"/g, '\\"') + '"]');
+  }
+  function pageUiReady(payload) { return !!(pageModule() && rowFor(payload) && doc.getElementById(AB.FORM_ID)); }
+  function driveRealUI(payload, intent) {
+    var R = pageModule(), tr = rowFor(payload), form = doc.getElementById(AB.FORM_ID);
+    var key = payload.resaleItemData[0].key;
+    try {
+      var sel = tr.querySelector('.hidden-quantity select');
+      if (sel && sel.value !== '1') sel.value = '1';
+      var anchor = tr.querySelector('a') || tr;
+      if (!tr.classList.contains('selected')) R.selectItem(key, 1, anchor);   // the page's own selection
+      var models = (typeof R.getTickets === 'function' && R.getTickets()) || [];
+      var picked = models.some(function (m) { return m && m.key === key && m.orderQuantity > 0; });
+      if (!picked) { log('page did not register the selection'); return false; }
+      intent.status = 'submitting'; intent.current = payload; setJSON('intent', intent);
+      if (intent.test) { store.del('testOnce'); state.testOnce = false; }
+      setAction('page selected the seat, pressing its own add-to-cart');
+      R.addToCart(form.querySelector('input') || form.firstElementChild);   // page builds + submits its form
+      win.setTimeout(function () {   // still here after 4 s? the page did not navigate: use our own form
+        if (pageMode() === 'item') { setAction('page add-to-cart did not navigate, falling back to own form'); submitRealForm(payload, csrfFrom(doc.documentElement.innerHTML), intent, intent.desc); }
+      }, 4000);
+      return true;
+    } catch (e) { log('driveRealUI failed: ' + e); return false; }
   }
   function submitRealForm(payload, csrf, intent, desc) {
     intent.status = 'submitting'; intent.desc = desc; setJSON('intent', intent);
