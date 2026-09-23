@@ -270,6 +270,28 @@ t('a single real listing gives no pair but is a valid 1-ticket test target', () 
   assert.strictEqual(p.resaleItemData[0].quantity, 1);
   assert.ok(p.resaleItemData[0].key.indexOf('NFF_RESALE_') === 0);
 });
+console.log('# one seat per submit: a pair becomes a queue of single-seat payloads');
+t('singlePayloads turns a chosen pair into two single-seat payloads, each complete', () => {
+  const k = 'NFF_RESALE_ROW_Q';
+  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 501, row: '60', seat: '975', key: k }), liveItem({ mid: 502, row: '60', seat: '976', key: k })] }));
+  const c = AB.choosePairs(seats);
+  const q = AB.singlePayloads(10229739913106, c.seats);
+  assert.strictEqual(q.length, 2);
+  q.forEach((p) => {
+    assert.strictEqual(p.performanceId, 10229739913106);
+    assert.strictEqual(p.resaleItemData.length, 1, 'exactly one row per submit');
+    assert.strictEqual(p.resaleItemData[0].quantity, 1);
+    assert.strictEqual(p.resaleItemData[0].key, k);
+    assert.deepStrictEqual(AB.payloadMissing(p), []);
+  });
+  assert.deepStrictEqual(q.map((p) => p.resaleItemData[0].movementIds[0]), [501, 502]);
+});
+t('singlePayloads for four seats gives four submits in seat order', () => {
+  const c = AB.choosePairs(S(5, 6, 7, 8));
+  const q = AB.singlePayloads(1, c.seats);
+  assert.strictEqual(q.length, 4);
+  assert.deepStrictEqual(q.map((p) => p.resaleItemData[0].movementIds[0]), [100, 101, 102, 103]);
+});
 t('checkout steps count as a successful landing', () => {
   assert.strictEqual(AB.pageMode('/checkout/beneficiaries', 'Checkout'), 'cart');
   assert.strictEqual(AB.pageMode('/cart/shoppingCart', 'Cart'), 'cart');

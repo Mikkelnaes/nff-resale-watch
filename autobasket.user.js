@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.2.6
+// @version      0.3.0
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.2.6',
+    VERSION: '0.3.0',
     MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -261,6 +261,14 @@
     });
     var pid = Number(performanceId);
     return { performanceId: isNaN(pid) ? performanceId : pid, resaleItemData: rows };
+  };
+  // The page can only add ONE seat per submit: its model lookup v(key) returns the first row
+  // with that key, so both seats of a pair (same key) can never be selected together, and a
+  // 2-seat submit is rejected (validation re-render for quantity 2, error page for two rows).
+  // A single-seat submit is the proven path (17 Sep). So a pair is bought as a SEQUENCE of
+  // single submits: seat A -> cart -> back to the match page -> seat B -> cart.
+  AB.singlePayloads = function (performanceId, seats) {
+    return seats.map(function (s) { return AB.buildPayload(performanceId, [s]); });
   };
   AB.payloadMissing = function (payload) {
     var missing = {};
@@ -571,9 +579,11 @@
     }
     if (!canTry(target)) return;
     state.busy = true;
-    // The payload travels with the intent so the match page can submit at once (no re-read);
-    // a miss loops back to the list, which re-reads fresh data before the next try.
-    setJSON('intent', { pid: target.id, name: target.name, key: target.key, desc: target.desc, payload: target.payload, test: !!target.test, createdAt: Date.now(), status: 'go' });
+    // The seats travel with the intent as a QUEUE of single-seat payloads: the match page
+    // submits one, lands in the cart, comes back for the next, until the queue is empty.
+    var queue = AB.singlePayloads(target.id, target.choice.seats);
+    setJSON('intent', { pid: target.id, name: target.name, key: target.key, desc: target.desc, queue: queue, got: [], total: queue.length,
+                        test: !!target.test, createdAt: Date.now(), status: 'go' });
     setAction((target.test ? 'TEST: ' : '') + 'grabbing ' + target.desc + ' -> entering the queue');
     win.setTimeout(function () { win.location.href = AB.matchPage(target.id); }, 50);
   }
@@ -585,18 +595,15 @@
     var pid = String(intent.pid);
     if (win.location.search.indexOf('performanceId=' + pid) < 0) return;   // a match we are not chasing
     if (intent.status === 'submitting') { checkPostSubmit(); return; }
-    setAction('through the queue on ' + intent.name + ', completing');
     var csrf = csrfFrom(doc.documentElement.innerHTML);
-    if (intent.payload && intent.payload.resaleItemData && intent.payload.resaleItemData.length) {
-      // Fast path: submit at once from what the list page already chose (saves a round trip).
-      // If it is stale the submit misses, we loop back to the list and re-read fresh data.
-      return submitRealForm(intent.payload, csrf, intent, intent.desc);
-    }
-    fetchItems(pid).then(function (raw) {   // legacy path: no payload carried, re-read here
-      var t = targetFor(pid, raw, !!intent.test);
-      if (!t) return failGrab(intent, 'the listing was gone by the time the queue let us in');
-      submitRealForm(t.payload, csrf, intent, t.desc);
-    }, function (err) { failGrab(intent, 'could not read the listing (' + err + ')'); });
+    // One seat per submit (see AB.singlePayloads). Take the next single-seat payload from
+    // the queue and submit it at once; the cart landing (checkPostSubmit) comes back for the rest.
+    var queue = intent.queue || (intent.payload ? [intent.payload] : []);
+    intent.got = intent.got || []; intent.total = intent.total || (queue.length + intent.got.length);
+    if (!queue.length) { store.del('intent'); return; }
+    intent.queue = queue; intent.current = queue[0];
+    setAction('through the queue on ' + intent.name + ', adding seat ' + (intent.got.length + 1) + '/' + intent.total);
+    submitRealForm(queue[0], csrf, intent, intent.desc);
   }
   function submitRealForm(payload, csrf, intent, desc) {
     intent.status = 'submitting'; intent.desc = desc; setJSON('intent', intent);
@@ -626,9 +633,9 @@
       headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' }, body: AB.buildFormBody(payload, csrf) })
       .then(function (r) {
         return r.text().then(function (t) {
-          if (/\/(cart|shoppingCart)/i.test(r.url) && !/error/i.test(r.url)) return succeed(desc, AB.BASKET_PATH, !!intent.test);
+          if (/\/(cart|shoppingCart)/i.test(r.url) && !/error/i.test(r.url)) return advance(intent);
           var j = null; try { j = JSON.parse(t); } catch (e) { /* ignore */ }
-          if (j && j.status === 'OK') return succeed(desc, (j.parameters && j.parameters.redirect) || AB.BASKET_PATH, !!intent.test);
+          if (j && j.status === 'OK') return advance(intent);
           failGrab(intent, 'shop refused (' + ((j && j.status) || 'queue/again') + ')');
         });
       }, function (e) { failGrab(intent, 'request failed: ' + e); });
@@ -639,13 +646,39 @@
     var intent = getJSON('intent');
     if (!intent || intent.status !== 'submitting') return false;
     var mode = pageMode();
-    if (mode === 'cart') { succeed(intent.desc, win.location.href, !!intent.test); return true; }
+    if (mode === 'cart') { advance(intent); return true; }
     if (mode === 'queue') { setAction('in the waiting room, holding for ' + intent.name); return true; }
     // Not the cart: report exactly where we landed so the next miss is diagnosable
     var where = win.location.pathname + win.location.search;
     var errText = (doc.body && doc.body.innerText || '').replace(/\s+/g, ' ').slice(0, 160);
-    failGrab(intent, 'submit landed on ' + where + ' ["' + doc.title + '"]: ' + errText);
+    var reason = 'submit landed on ' + where + ' ["' + doc.title + '"]: ' + errText;
+    if (intent.got && intent.got.length) partialFail(intent, reason); else failGrab(intent, reason);
     return true;
+  }
+  // One seat just landed in the cart. More in the queue -> straight back to the match page
+  // for the next one; queue empty -> the whole set is reserved.
+  function advance(intent) {
+    intent.got = intent.got || []; intent.queue = intent.queue || [];
+    if (intent.current) intent.got.push(intent.current);
+    intent.queue.shift(); intent.current = null;
+    if (intent.queue.length) {
+      intent.status = 'go'; setJSON('intent', intent);
+      setAction('seat ' + intent.got.length + '/' + intent.total + ' in the cart, fetching the next');
+      win.setTimeout(function () { win.location.href = AB.matchPage(intent.pid); }, 150);
+      return;
+    }
+    succeed(intent.desc, AB.BASKET_PATH, !!intent.test);
+  }
+  // Some seats are in the cart but the next one was refused or gone: stop, tell the user
+  // exactly what they hold, and let them decide to pay for those or empty the cart.
+  function partialFail(intent, reason) {
+    store.del('grab'); store.del('intent'); state.busy = false;
+    store.set('reservedAt', String(Date.now() + AB.COOLDOWN_MS));
+    var n = (intent.got || []).length, tot = intent.total || (n + (intent.queue || []).length);
+    setAction('PARTIAL: ' + n + ' of ' + tot + ' seats in the cart; the rest failed');
+    alarm();
+    push('urgent', AB.OWN_TITLE_PREFIX + ': PARTIAL ' + n + '/' + tot, intent.desc + ': ' + n + ' of ' + tot + ' seats are in your cart, the rest failed (' + reason.slice(0, 120) + '). Decide now: pay for ' + n + ' or empty the cart.', AB.BASKET_PATH);
+    win.setTimeout(function () { win.location.href = AB.BASKET_PATH; }, 300);
   }
   function succeed(desc, redirect, test) {
     store.del('grab'); store.del('intent'); state.busy = false;
