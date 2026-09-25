@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.4.2
+// @version      0.4.3
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.4.2',
+    VERSION: '0.4.3',
     MATCHES: { '10229739913107': 'Portugal' },   // Denmark (10229739913106, 24 Sep) is over; Portugal is Sun 27 Sep 20:45
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -545,6 +545,7 @@
         return fetchItems(id).then(function (raw) {
           state.pollLast = hhmm() + ' ok'; state.loginWarned = false;
           var t = targetFor(id, raw, state.testOnce); if (t && !found) found = t;
+          if (!t) noteSeen(id, raw);
         }, function (err) {
           state.pollLast = hhmm() + ' ' + err;
           if (err === 'login' && !state.loginWarned) {   // session dropped: tell the phone once
@@ -564,6 +565,20 @@
   // count from the old payload; now a seat-set unseen for REAPPEAR_MS and back again gets
   // a fresh window and fresh tries. (2) giving up used to be silent; now it alarms and
   // pushes "buy by hand" once, because the seats are still listed at that moment.
+  // Since 25 Sep the cloud watcher is blocked by DataDome (HTTP 403 for non-browser clients),
+  // so this tab is the ONLY alarm. Push once per distinct listing when tickets are seen but
+  // no valid 2/4 adjacent set exists (a valid set is handled by act(), which pushes outcomes).
+  function noteSeen(id, raw) {
+    var seats = AB.expandSeats(AB.normalizeItems(raw));
+    if (!seats.length) { state.seenKey = ''; return; }
+    var key = seats.map(function (s) { return String(s.movementId); }).sort().join(',');
+    if (state.seenKey === key) return;
+    state.seenKey = key;
+    var name = AB.MATCHES[id];
+    var txt = name + ': ' + seats.length + ' ticket(s) listed but no valid 2/4 adjacent set (' + AB.describeSeats(seats) + '). Not reserved. Buy by hand if you want them.';
+    setAction(txt); alarm();
+    push('high', AB.OWN_TITLE_PREFIX + ': seen ' + name, txt, AB.matchPage(id));
+  }
   function canTry(target) {
     var now = Date.now(), grab = getJSON('grab');
     var fresh = !grab || grab.key !== target.key || (grab.lastSeen && now - grab.lastSeen > AB.REAPPEAR_MS);
