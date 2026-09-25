@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.4.1
+// @version      0.4.2
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,8 +36,8 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.4.1',
-    MATCHES: { '10229739913106': 'Denmark', '10229739913107': 'Portugal' },
+    VERSION: '0.4.2',
+    MATCHES: { '10229739913107': 'Portugal' },   // Denmark (10229739913106, 24 Sep) is over; Portugal is Sun 27 Sep 20:45
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
     EXCLUDE_AREA: null,           // e.g. /^(10[7-9]|11[0-2]|40[7-9]|41[0-4])$/ to skip the away blocks; null = any section
