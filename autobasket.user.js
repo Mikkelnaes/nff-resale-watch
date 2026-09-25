@@ -36,12 +36,15 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.4.5',
+    VERSION: '0.4.6',
     MATCHES: { '10229739913107': 'Portugal' },   // Denmark (10229739913106, 24 Sep) is over; Portugal is Sun 27 Sep 20:45
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
     EXCLUDE_AREA: null,           // e.g. /^(10[7-9]|11[0-2]|40[7-9]|41[0-4])$/ to skip the away blocks; null = any section
     IGNORE_MOVEMENTS: ['10229785497024', '10229785497025'],   // the 23 Sep "ghost" Denmark pair nobody can buy (bounced all day; manual add from 2 devices failed)
+    // Same idea by seat position ("<block> r<row> s<seat>", exactly as the grab trace prints it):
+    // the 25 Sep Portugal pair 412 row 31 seats 479-480 (NFF's own seat-map flow -> Error Page, 10 tries).
+    IGNORE_SEATS: ['412 r31 s479', '412 r31 s480'],
     SEATMAP_WAIT_MS: 8000,        // wait for the seat map (SeatMap/SeatList) to initialise on the match page
     SEATS_WAIT_MS: 10000,         // wait for our seats to be loaded into the map after zooming to the block
     POLL_MS: 3000,                // in-browser listing poll interval
@@ -203,6 +206,7 @@
   };
 
   // ---- seat selection ------------------------------------------------------------
+  AB.seatPos = function (s) { return s.area + ' r' + s.row + ' s' + s.seatNo; };   // "412 r31 s479", the trace/ignore-list format
   AB.choosePairs = function (seats, want) {
     want = want || AB.WANT;
     var groups = {};
@@ -210,6 +214,7 @@
       if (s.movementId === undefined || s.seatNo === null || s.area === null || s.row === null) return;
       if (AB.EXCLUDE_AREA && AB.EXCLUDE_AREA.test(s.area)) return;
       if (AB.IGNORE_MOVEMENTS && AB.IGNORE_MOVEMENTS.indexOf(String(s.movementId)) >= 0) return;   // known unbuyable listing
+      if (AB.IGNORE_SEATS && AB.IGNORE_SEATS.indexOf(AB.seatPos(s)) >= 0) return;                  // known unbuyable seat
       var g = s.area + '' + s.row;
       (groups[g] = groups[g] || []).push(s);
     });
@@ -623,7 +628,7 @@
     });
     setJSON('intent', { pid: target.id, name: target.name, key: target.key, desc: target.desc, queue: [target.payload], got: [], total: 1,
                         seats: seatSpecs, test: !!target.test, createdAt: Date.now(), status: 'go' });
-    store.del('trace'); tr('grab ' + target.desc + ' (' + seatSpecs.map(function (s) { return s.area + ' r' + s.row + ' s' + s.seatNo; }).join(', ') + ') block ' + seatSpecs[0].blockId);
+    store.del('trace'); tr('grab ' + target.desc + ' (' + seatSpecs.map(AB.seatPos).join(', ') + ') block ' + seatSpecs[0].blockId + ' mids ' + seatSpecs.map(function (s) { return s.mid; }).join('/'));
     setAction((target.test ? 'TEST: ' : '') + 'grabbing ' + target.desc + ' -> entering the queue');
     win.setTimeout(function () { win.location.href = AB.matchPage(target.id); }, 50);
   }

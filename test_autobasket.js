@@ -175,6 +175,19 @@ t('ignored movement ids (known unbuyable listing) are never chosen', () => {
 t('the real ghost pair is on the ignore list', () => {
   assert.ok(AB.IGNORE_MOVEMENTS.indexOf('10229785497024') >= 0 && AB.IGNORE_MOVEMENTS.indexOf('10229785497025') >= 0);
 });
+t('ignored seat positions (known unbuyable seats) are never chosen', () => {
+  const old = AB.IGNORE_SEATS; AB.IGNORE_SEATS = ['B7 r12 s5', 'B7 r12 s6'];
+  try {
+    assert.strictEqual(AB.choosePairs(S(5, 6)), null, 'the ignored pair itself');
+    const c = AB.choosePairs(S(5, 6, 7, 8));
+    assert.strictEqual(c.count, 2, 'the remaining two seats still form a pair');
+    assert.deepStrictEqual(nos(c), [7, 8]);
+  } finally { AB.IGNORE_SEATS = old; }
+});
+t('the 25 Sep Portugal ghost pair is on the seat ignore list', () => {
+  assert.deepStrictEqual(AB.IGNORE_SEATS, ['412 r31 s479', '412 r31 s480']);
+});
+t('seatPos prints the trace / ignore-list format', () => assert.strictEqual(AB.seatPos({ area: '412', row: '31', seatNo: 479 }), '412 r31 s479'));
 t('excluded sections are skipped', () => {
   const old = AB.EXCLUDE_AREA; AB.EXCLUDE_AREA = /^B7$/;
   try { assert.strictEqual(AB.choosePairs(S(5, 6)), null); } finally { AB.EXCLUDE_AREA = old; }
