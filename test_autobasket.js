@@ -328,6 +328,8 @@ t('match page link carries the performance id', () => assert.ok(AB.matchPage('10
 
 console.log('# page mode + intent (state machine across the queue navigation)');
 t('list page is recognised', () => assert.strictEqual(AB.pageMode('/list/resaleProducts/', 'Mens Nations League'), 'list'));
+t('the new /list/events landing page (25 Sep redirect target) is also the list page', () => assert.strictEqual(AB.pageMode('/list/events', 'Nations League'), 'list'));
+t('the secured item page path is still the item page', () => assert.strictEqual(AB.pageMode('/secured/selection/resale/item', 'Item selection'), 'item'));
 t('item page is recognised', () => assert.strictEqual(AB.pageMode('/selection/resale/item', 'Item selection'), 'item'));
 t('cart page is recognised', () => assert.strictEqual(AB.pageMode('/cart/shoppingCart', 'Cart'), 'cart'));
 t('the waiting room is recognised by title', () => assert.strictEqual(AB.pageMode('/anything', 'Waiting Room'), 'queue'));

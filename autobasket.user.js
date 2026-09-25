@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.4.3
+// @version      0.4.4
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.4.3',
+    VERSION: '0.4.4',
     MATCHES: { '10229739913107': 'Portugal' },   // Denmark (10229739913106, 24 Sep) is over; Portugal is Sun 27 Sep 20:45
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -333,7 +333,7 @@
     if (/Waiting Room|Cookies appear to be disabled/i.test(title) || /cookieWarning|pkpcontroller/i.test(pathname)) return 'queue';
     if (/\/cart(\/|\b)|\/checkout(\/|\b)/i.test(pathname)) return 'cart';   // checkout steps mean the basket holds the seats
     if (/\/selection\/resale\/item(\?|\b)/i.test(pathname)) return 'item';
-    if (/\/list\/resale/i.test(pathname)) return 'list';
+    if (/\/list\/(resale|events)/i.test(pathname)) return 'list';   // 25 Sep: /list/resaleProducts now redirects to /list/events
     return 'other';
   };
   AB.intentFresh = function (intent, now, ttl) {
