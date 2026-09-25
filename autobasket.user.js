@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.4.4
+// @version      0.4.5
 // @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -36,7 +36,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.4.4',
+    VERSION: '0.4.5',
     MATCHES: { '10229739913107': 'Portugal' },   // Denmark (10229739913106, 24 Sep) is over; Portugal is Sun 27 Sep 20:45
     WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
@@ -51,7 +51,7 @@
     MAX_TRIES: 25,                // ...and at most this many navigations
     BACKOFF_MS: 4000,             // wait this long between attempts on the same seats
     REAPPEAR_MS: 45 * 1000,       // the same seats unseen this long, then back = a re-release: fresh window and tries
-    INTENT_TTL_MS: 3 * 60 * 1000, // a stored grab intent older than this is stale
+    INTENT_TTL_MS: 8 * 60 * 1000, // a stored grab intent older than this is stale (the waiting room can take minutes)
     STALE_MS: 2 * 60 * 1000,      // ntfy alerts older than this are ignored
     KEEPALIVE_MS: 10 * 60 * 1000, // light request so the login does not time out
     ALARM_SECONDS: 2,             // short beep sequence
@@ -350,6 +350,13 @@
     set: function (k, v) { try { win.localStorage.setItem('autobasket.' + k, String(v)); } catch (e) { /* ignore */ } },
     del: function (k) { try { win.localStorage.removeItem('autobasket.' + k); } catch (e) { /* ignore */ } }
   };
+  function tabIdent() {   // stable per browser tab across our own navigations, so the leader lock follows the tab
+    try {
+      var k = 'autobasket.tabId', v = win.sessionStorage.getItem(k);
+      if (!v) { v = Math.random().toString(36).slice(2); win.sessionStorage.setItem(k, v); }
+      return v;
+    } catch (e) { return Math.random().toString(36).slice(2); }
+  }
   function getJSON(k) { try { return JSON.parse(store.get(k, 'null')); } catch (e) { return null; } }
   function setJSON(k, v) { if (v) store.set(k, JSON.stringify(v)); else store.del(k); }
 
@@ -359,7 +366,7 @@
     keepalive: store.get('keepalive', '1') === '1',
     testOnce: store.get('testOnce', '0') === '1',   // one-off: reserve the next single ticket to prove the submit path
     mode: '-', sse: null, sseState: 'not connected', pollLast: '-', lastEvent: '-', lastAction: 'idle',
-    busy: false, leader: false, lastDry: '', tabId: Math.random().toString(36).slice(2), audio: null, flashTimer: null
+    busy: false, leader: false, lastDry: '', tabId: tabIdent(), audio: null, flashTimer: null
   };
   function hhmm(t) { var d = t ? new Date(t) : new Date(); return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2); }
   function log(s) { try { win.console.log('[auto-basket ' + hhmm() + '] ' + s); } catch (e) { /* ignore */ } }
@@ -624,10 +631,18 @@
   // ---- item page: complete the reservation on the real page ----------------------
   function fulfillItemPage() {
     var intent = getJSON('intent'), now = Date.now();
-    if (!AB.intentFresh(intent, now, AB.INTENT_TTL_MS)) { store.del('intent'); return; }
-    var pid = String(intent.pid);
-    if (win.location.search.indexOf('performanceId=' + pid) < 0) return;   // a match we are not chasing
+    if (!intent) return;
+    if (!AB.intentFresh(intent, now, AB.INTENT_TTL_MS)) {   // never silently: say so and go back to watching
+      return failGrab(intent, 'grab intent expired after ' + Math.round((now - (intent.createdAt || now)) / 60000) + ' min (waiting room too slow?)');
+    }
     if (intent.status === 'submitting') { checkPostSubmit(); return; }
+    // The shop's generic error page shares the item URL prefix: recognise it before anything else.
+    var bodyText = (doc.body && doc.body.innerText || '');
+    if (/Error Page|^Feil\b/i.test(doc.title) || /unable to process your request|kan dessverre ikke behandle/i.test(bodyText)) {
+      return failGrab(intent, 'landed on the shop error page before selecting (' + win.location.pathname + ')');
+    }
+    var pid = String(intent.pid);
+    if (win.location.search.indexOf('performanceId=' + pid) < 0) { tr('item page for another match, ignoring'); return; }
     var csrf = csrfFrom(doc.documentElement.innerHTML);
     // One seat per submit (see AB.singlePayloads). Take the next single-seat payload from
     // the queue and submit it at once; the cart landing (checkPostSubmit) comes back for the rest.
@@ -665,14 +680,19 @@
     for (var i = 0; i < rs.length; i++) { var ri = rs[i] && rs[i].resaleInfo; if (ri && String(ri.resaleMovId) === String(mid)) return rs[i]; }
     return null;
   }
-  function findSeatFeatures(specs) {   // -> one {spec, feature, offer} per spec found in the loaded map features
+  function findSeatFeatures(specs) {   // -> one {spec, feature, offer|null} per spec found in the loaded map features
     var feats = (win.SeatMap && win.SeatMap.seatsLayer && win.SeatMap.seatsLayer.features) || [], out = [];
     specs.forEach(function (sp) {
       for (var i = 0; i < feats.length; i++) {
-        var f = feats[i], off = offerFor(f, sp.mid), d = f && f.data;
-        if (!off && d && sp.seatNo !== null && String(d.number) === String(sp.seatNo) && String(d.row) === String(sp.row) &&
-            (!sp.area || String(d.block) === String(sp.area))) off = (d.resaleSeats && d.resaleSeats[0]) || null;
-        if (off) { out.push({ spec: sp, feature: f, offer: off }); break; }
+        var f = feats[i], d = f && f.data; if (!d) continue;
+        var off = offerFor(f, sp.mid);
+        // Position match: same seat number and row, and the same block (by label or by id).
+        // The resale offer is NOT required here: the page's own click flow fetches it.
+        var sameBlock = (!sp.area && (sp.blockId === undefined || sp.blockId === null)) ||
+                        (sp.area && String(d.block) === String(sp.area)) ||
+                        (sp.blockId !== undefined && sp.blockId !== null && String(d.blockId) === String(sp.blockId));
+        var byPos = sp.seatNo !== null && String(d.number) === String(sp.seatNo) && String(d.row) === String(sp.row) && sameBlock;
+        if (off || byPos) { out.push({ spec: sp, feature: f, offer: off || (d.resaleSeats && d.resaleSeats[0]) || null }); break; }
       }
     });
     return out;
@@ -686,12 +706,22 @@
       var SM = win.SeatMap, SL = win.SeatList;
       tr('seat map ready, features=' + ((SM.seatsLayer.features || []).length) + ' resaleMode=' + (SL.isResaleMode && SL.isResaleMode()));
       var bid = specs[0].blockId;
-      if (bid !== undefined && bid !== null) {   // zoom both ways: block ids may be numbers or strings
-        try { SM.zoomToBlockOrArea(Number(bid)); } catch (e1) { /* ignore */ }
-        try { SM.zoomToBlockOrArea(String(bid)); } catch (e2) { /* ignore */ }
-        tr('zoomed to block ' + bid);
-      }
-      return waitFor(function () {
+      // Blocks load asynchronously; zooming before they exist does nothing (and seats only
+      // load for the zoomed-in view). Wait for the blocks layer, then zoom to our block.
+      return waitFor(function () { return !!(SM.blocksLayer && SM.blocksLayer.features && SM.blocksLayer.features.length); }, 5000, 200).then(function (blocksOk) {
+        var blocks = (SM.blocksLayer && SM.blocksLayer.features) || [];
+        var hit = null;
+        for (var i = 0; i < blocks.length; i++) { var bd = blocks[i] && blocks[i].data; if (bd && bid !== undefined && bid !== null && String(bd.id) === String(bid)) { hit = blocks[i]; break; } }
+        tr('blocks loaded=' + blocksOk + ' count=' + blocks.length + ' ourBlock ' + bid + (hit ? ' FOUND' : ' not found' + (blocks[0] && blocks[0].data ? ' (sample id ' + blocks[0].data.id + ')' : '')));
+        if (hit) {
+          try { SM.map.zoomToExtent(SM.increaseBounds(hit.geometry.bounds), true); tr('zoomed to block extent'); }
+          catch (e0) { try { SM.zoomToBlockOrArea(Number(bid)); SM.zoomToBlockOrArea(String(bid)); tr('zoomed via zoomToBlockOrArea'); } catch (e1) { tr('zoom failed: ' + e1); } }
+        } else if (bid !== undefined && bid !== null) {
+          try { SM.zoomToBlockOrArea(Number(bid)); } catch (e2) { /* ignore */ }
+          try { SM.zoomToBlockOrArea(String(bid)); } catch (e3) { /* ignore */ }
+        }
+        return null;
+      }).then(function () { return waitFor(function () {
         return !(SM.isFreeSeatsCallsInProgress && SM.isFreeSeatsCallsInProgress()) && findSeatFeatures(specs).length === specs.length;
       }, AB.SEATS_WAIT_MS, 200).then(function () {
         var hits = findSeatFeatures(specs), feats = (SM.seatsLayer.features || []);
@@ -750,8 +780,9 @@
           }, 4000);
           return true;
         });
-      });
-    });
+      });   // seats found -> select -> submit
+      });   // after the blocks wait / zoom
+    });     // after seat map ready
   }
   function waitFor(cond, timeoutMs, stepMs) {
     return new Promise(function (resolve) {
