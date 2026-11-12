@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.4.5
-// @description  Watches NFF resale from your own logged-in browser, and when 2 or 4 adjacent Norway-Denmark / Norway-Portugal seats appear it rides the real waiting room and reserves them in your basket.
+// @version      0.5.0
+// @description  Watches NFF resale from your own logged-in browser, and when 4-8 seats together appear for the chosen match it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
 // @run-at       document-idle
@@ -27,8 +27,16 @@
      catch the ~15 min hold-expiry re-release, up to MAX_TRIES within WINDOW_MS.
 
   It never pays: on success it alarms, pushes "RESERVED, pay now" and opens the cart, and
-  you pay by hand within ~15 min. Adjacent = same section, same row, seat numbers one
-  apart; 4 preferred, else 2, never 1 or 3. Nothing bypasses a captcha.
+  you pay by hand within ~15 min. Nothing bypasses a captcha.
+
+  What it takes (v0.5.0, 14 Nov match): ONE group of 4, 6, 7 or 8 seats that sit together,
+  never 1-3. It never leaves a single listed seat stranded when another size avoids that
+  (NFF may refuse such a buy): 5 in a row -> 5, 9 in a row -> 7. Together = one run of
+  neighbouring seats in a row (best), or runs of at least 2 seats in 2-3 consecutive rows of
+  the same block, one behind the other. More seats beat fewer; at the same count one row beats
+  several. A multi-row group is measured on
+  the seat map before submitting and skipped if the rows are not actually behind each other.
+  The match is set with the overlay's "Match" button (paste the match URL or performanceId).
 
   The pure decision logic is exported for `node test_autobasket.js`.
 */
@@ -36,15 +44,23 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.4.6',
-    MATCHES: { '10229739913107': 'Portugal' },   // Denmark (10229739913106, 24 Sep) is over; Portugal is Sun 27 Sep 20:45
-    WANT: [4, 2],                 // 4 first (two adjacent pairs), else 2 (one pair); never 1 or 3
+    VERSION: '0.5.0',
+    // performanceId -> name (14 Nov 2026, Ullevaal; link from the resale list, 12 Nov). The overlay's
+    // "Match" button can add another one (stored in this browser).
+    MATCHES: { '10229739913108': 'NL 14 Nov' },
+    DEFAULT_MATCH_NAME: 'NL 14 Nov',
+    ALLOWED: [8, 7, 6, 4],        // ticket counts we take, best first: never 1-3, at most 8
+    ONLY_IF_NO_LONE_SEAT: [5],    // 5 only when 4 would leave one seat alone (NFF may refuse a stranded seat)
+    MIN_PER_ROW: 2,               // a multi-row group needs at least this many neighbours in each row
+    MAX_ROWS: 3,                  // ...and spans at most this many consecutive rows
+    ROW_GAP_SEATS: 6,             // list-time filter: seat ranges in neighbouring rows overlap or are at most this far apart
+    NEAR_PITCH: 3.5,              // seat-map check: row centres at most this many seat widths apart
     ADJACENT_STEP: 1,             // seat numbers this far apart count as neighbours (set 2 if Ullevaal numbers odd/even from the aisle)
     EXCLUDE_AREA: null,           // e.g. /^(10[7-9]|11[0-2]|40[7-9]|41[0-4])$/ to skip the away blocks; null = any section
-    IGNORE_MOVEMENTS: ['10229785497024', '10229785497025'],   // the 23 Sep "ghost" Denmark pair nobody can buy (bounced all day; manual add from 2 devices failed)
-    // Same idea by seat position ("<block> r<row> s<seat>", exactly as the grab trace prints it):
-    // the 25 Sep Portugal pair 412 row 31 seats 479-480 (NFF's own seat-map flow -> Error Page, 10 tries).
-    IGNORE_SEATS: ['412 r31 s479', '412 r31 s480'],
+    // Known unbuyable "ghost" listings, by movement id or by seat position ("<block> r<row> s<seat>",
+    // exactly as the grab trace prints it). The September ghosts were for other matches: cleared.
+    IGNORE_MOVEMENTS: [],
+    IGNORE_SEATS: [],
     SEATMAP_WAIT_MS: 8000,        // wait for the seat map (SeatMap/SeatList) to initialise on the match page
     SEATS_WAIT_MS: 10000,         // wait for our seats to be loaded into the map after zooming to the block
     POLL_MS: 3000,                // in-browser listing poll interval
@@ -207,42 +223,150 @@
 
   // ---- seat selection ------------------------------------------------------------
   AB.seatPos = function (s) { return s.area + ' r' + s.row + ' s' + s.seatNo; };   // "412 r31 s479", the trace/ignore-list format
-  AB.choosePairs = function (seats, want) {
-    want = want || AB.WANT;
-    var groups = {};
+  function runsOf(list) {   // one row's seats -> runs of neighbours (seat numbers ADJACENT_STEP apart), duplicates dropped
+    var arr = list.slice().sort(function (a, b) { return a.seatNo - b.seatNo; }), runs = [], run = null;
+    arr.forEach(function (s) {
+      if (run && run[run.length - 1].seatNo === s.seatNo) return;
+      if (run && s.seatNo - run[run.length - 1].seatNo === AB.ADJACENT_STEP) { run.push(s); return; }
+      run = [s]; runs.push(run);
+    });
+    return runs;
+  }
+  function centre(run) { return (run[0].seatNo + run[run.length - 1].seatNo) / 2; }
+  function splits(lens, n) {   // every way to take k_i seats (MIN_PER_ROW..len_i) from each row so they add up to n
+    var out = [];
+    (function rec(i, left, acc) {
+      if (i === lens.length) { if (left === 0) out.push(acc.slice()); return; }
+      for (var k = AB.MIN_PER_ROW; k <= Math.min(lens[i], left); k++) { acc.push(k); rec(i + 1, left - k, acc); acc.pop(); }
+    })(0, n, []);
+    return out;
+  }
+  // runs: one run of neighbours per row (rows in order). -> the best group of an ALLOWED size
+  // inside them, or null. Within a run it prefers a window that leaves no single seat behind
+  // (NFF's no-orphan-seat rule may refuse one) and, across rows, windows behind each other.
+  AB.fitRuns = function (runs) {
+    var lens = runs.map(function (r) { return r.length; });
+    var target = runs.reduce(function (a, r) { return a + centre(r); }, 0) / runs.length;
+    // The largest size that leaves no lone seat behind wins; 5 only ever that way (it is chosen
+    // exactly when 4 would strand one seat). If every size strands one, the largest ALLOWED.
+    var sizes = AB.ALLOWED.concat(AB.ONLY_IF_NO_LONE_SEAT).sort(function (x, y) { return y - x; }), fallback = null;
+    for (var a = 0; a < sizes.length; a++) {
+      var fit = fitSize(runs, lens, target, sizes[a]);
+      if (!fit) continue;
+      if (fit.orphans === 0) return fit;
+      if (!fallback && AB.ALLOWED.indexOf(sizes[a]) >= 0) fallback = fit;
+    }
+    return fallback;
+  };
+  function fitSize(runs, lens, target, n) {   // the best way to take exactly n seats from these runs, or null
+    var total = lens.reduce(function (a, b) { return a + b; }, 0);
+    if (n > total) return null;
+    var best = null;
+    (runs.length === 1 ? [[n]] : splits(lens, n)).forEach(function (ks) {
+      var orph = 0, imb = Math.max.apply(null, ks) - Math.min.apply(null, ks);
+      ks.forEach(function (k, i) { if (lens[i] - k === 1) orph++; });
+      if (!best || orph < best.orph || (orph === best.orph && imb < best.imb)) best = { ks: ks, orph: orph, imb: imb };
+    });
+    if (!best) return null;
+    var orphans = 0;
+    var rows = runs.map(function (run, i) {
+      var k = best.ks[i], pick = null;
+      for (var s = 0; s + k <= run.length; s++) {
+        var o = (s === 1 ? 1 : 0) + (run.length - k - s === 1 ? 1 : 0);
+        var dist = runs.length > 1 ? Math.abs(centre(run.slice(s, s + k)) - target) : 0;
+        if (!pick || o < pick.o || (o === pick.o && dist < pick.dist)) pick = { s: s, o: o, dist: dist };
+      }
+      orphans += pick.o;
+      return run.slice(pick.s, pick.s + k);
+    });
+    var spread = 0;
+    for (var r = 1; r < rows.length; r++) spread += Math.abs(centre(rows[r]) - centre(rows[r - 1]));
+    var seats = [].concat.apply([], rows);
+    return { count: n, seats: seats, rows: rows, orphans: orphans, spread: spread,
+             price: seats.reduce(function (p, s) { return p + (s.item.price || 0); }, 0) };
+  }
+  function combos(lists) {   // one element from each list, every combination
+    return lists.reduce(function (acc, list) {
+      var out = []; acc.forEach(function (c) { list.forEach(function (x) { out.push(c.concat([x])); }); }); return out;
+    }, [[]]);
+  }
+  function rowsClose(runs) {   // seat-number ranges of neighbouring rows overlap or nearly do
+    for (var i = 1; i < runs.length; i++) {
+      var a = runs[i - 1], b = runs[i];
+      var gap = Math.max(a[0].seatNo, b[0].seatNo) - Math.min(a[a.length - 1].seatNo, b[b.length - 1].seatNo);
+      if (gap > AB.ROW_GAP_SEATS) return false;
+    }
+    return true;
+  }
+  // seats -> the best group {count, seats, rows, orphans, spread, price} or null.
+  // skipKeys: seat keys (AB.seatKey) to pass over, e.g. a multi-row group the seat map showed apart.
+  AB.chooseGroup = function (seats, skipKeys) {
+    var byArea = {};
     seats.forEach(function (s) {
-      if (s.movementId === undefined || s.seatNo === null || s.area === null || s.row === null) return;
+      if (s.movementId === undefined || s.movementId === null || s.seatNo === null || s.area === null || s.row === null) return;
       if (AB.EXCLUDE_AREA && AB.EXCLUDE_AREA.test(s.area)) return;
       if (AB.IGNORE_MOVEMENTS && AB.IGNORE_MOVEMENTS.indexOf(String(s.movementId)) >= 0) return;   // known unbuyable listing
       if (AB.IGNORE_SEATS && AB.IGNORE_SEATS.indexOf(AB.seatPos(s)) >= 0) return;                  // known unbuyable seat
-      var g = s.area + '' + s.row;
-      (groups[g] = groups[g] || []).push(s);
+      var rows = byArea[s.area] = byArea[s.area] || {};
+      (rows[s.row] = rows[s.row] || []).push(s);
     });
-    var pairs = [];
-    Object.keys(groups).forEach(function (g) {
-      var arr = groups[g].sort(function (a, b) { return a.seatNo - b.seatNo; }), uniq = [];
-      arr.forEach(function (s) { if (!uniq.length || uniq[uniq.length - 1].seatNo !== s.seatNo) uniq.push(s); });
-      var run = [uniq[0]];
-      for (var i = 1; i <= uniq.length; i++) {
-        if (i < uniq.length && uniq[i].seatNo - uniq[i - 1].seatNo === AB.ADJACENT_STEP) { run.push(uniq[i]); continue; }
-        for (var j = 0; j + 1 < run.length; j += 2) pairs.push({ seats: [run[j], run[j + 1]], runLength: run.length });
-        if (i < uniq.length) run = [uniq[i]];
-      }
+    var cands = [];
+    Object.keys(byArea).forEach(function (area) {
+      var runsByRow = {};
+      Object.keys(byArea[area]).forEach(function (row) {
+        var runs = runsOf(byArea[area][row]).filter(function (r) { return r.length >= AB.MIN_PER_ROW; });
+        if (runs.length) runsByRow[row] = runs;
+      });
+      Object.keys(runsByRow).forEach(function (row) {   // one row
+        runsByRow[row].forEach(function (run) { var c = AB.fitRuns([run]); if (c) cands.push(c); });
+      });
+      Object.keys(runsByRow).filter(function (row) { return /^\d+$/.test(row); }).forEach(function (row) {   // rows behind each other
+        var lists = [runsByRow[row]];
+        for (var k = 2; k <= AB.MAX_ROWS; k++) {
+          var next = runsByRow[String(Number(row) + k - 1)];
+          if (!next) break;
+          lists.push(next);
+          combos(lists).forEach(function (runs) { if (rowsClose(runs)) { var c = AB.fitRuns(runs); if (c) cands.push(c); } });
+        }
+      });
     });
-    if (!pairs.length) return null;
-    pairs.sort(function (a, b) {
-      return b.runLength - a.runLength || (a.seats[0].item.price || 0) - (b.seats[0].item.price || 0) || a.seats[0].seatNo - b.seats[0].seatNo;
+    cands = cands.filter(function (c) { return !skipKeys || skipKeys.indexOf(AB.seatKey(c)) < 0; });
+    if (!cands.length) return null;
+    cands.sort(function (a, b) {
+      return b.count - a.count || a.rows.length - b.rows.length || a.orphans - b.orphans || a.spread - b.spread ||
+             a.price - b.price || String(a.seats[0].area).localeCompare(String(b.seats[0].area)) || a.seats[0].seatNo - b.seats[0].seatNo;
     });
-    for (var w = 0; w < want.length; w++) {
-      var need = want[w] / 2;
-      if (need !== Math.floor(need) || need < 1) continue;
-      if (pairs.length >= need) {
-        var chosen = pairs.slice(0, need), picked = [];
-        chosen.forEach(function (p) { picked = picked.concat(p.seats); });
-        return { count: want[w], seats: picked, pairs: chosen.map(function (p) { return p.seats; }) };
-      }
-    }
-    return null;
+    return cands[0];
+  };
+  // Is a multi-row group really behind each other on the seat map? pts: [{row, seatNo, x, y}].
+  // -> {ok: true|false|null (could not measure), why}
+  AB.rowsNear = function (pts) {
+    if (!pts.length || pts.some(function (p) { return typeof p.x !== 'number' || typeof p.y !== 'number' || isNaN(p.x) || isNaN(p.y); })) return { ok: null, why: 'no seat coordinates' };
+    var byRow = {};
+    pts.forEach(function (p) { (byRow[p.row] = byRow[p.row] || []).push(p); });
+    var rows = Object.keys(byRow).sort(function (a, b) { return Number(a) - Number(b); }), gaps = [];
+    function d(a, b) { return Math.sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)); }
+    rows.forEach(function (r) {
+      var a = byRow[r].slice().sort(function (x, y) { return x.seatNo - y.seatNo; });
+      for (var i = 1; i < a.length; i++) if (a[i].seatNo - a[i - 1].seatNo === AB.ADJACENT_STEP) gaps.push(d(a[i], a[i - 1]));
+    });
+    if (!gaps.length) return { ok: null, why: 'no seat width' };
+    gaps.sort(function (a, b) { return a - b; });
+    var pitch = gaps[Math.floor(gaps.length / 2)];
+    if (!(pitch > 0)) return { ok: null, why: 'no seat width' };
+    var cen = rows.map(function (r) {
+      var l = byRow[r];
+      return { x: l.reduce(function (s, p) { return s + p.x; }, 0) / l.length, y: l.reduce(function (s, p) { return s + p.y; }, 0) / l.length };
+    });
+    var worst = 0;
+    for (var i = 1; i < cen.length; i++) worst = Math.max(worst, d(cen[i], cen[i - 1]) / pitch);
+    return { ok: worst <= AB.NEAR_PITCH, why: 'row centres ' + worst.toFixed(1) + ' seat widths apart (max ' + AB.NEAR_PITCH + ')' };
+  };
+  // "https://...?performanceId=123..." / "...perfId=123..." / "123..." -> "123..." (else null; a productId is NOT a match id)
+  AB.parseMatchId = function (text) {
+    text = String(text || '').trim();
+    var m = /(?:performanceId|perfId)=(\d{6,})/i.exec(text) || /^(\d{6,})$/.exec(text);
+    return m ? m[1] : null;
   };
   AB.seatKey = function (choice) {
     if (!choice || !choice.seats) return '';
@@ -317,11 +441,12 @@
     if (price === null || price === undefined) return null;
     return Math.round(price >= 100000 ? price / 1000 : price);
   };
-  AB.describePairs = function (pairs) {
-    return pairs.map(function (p) {
-      var a = p[0], b = p[1], it = a.item, kr = AB.kr(it.price);
-      return a.area + ' row ' + a.row + ' seats ' + a.seatNo + '-' + b.seatNo + (it.category ? ' ' + it.category : '') + (kr !== null ? ' ' + kr + ' kr' : '');
-    }).join('; ');
+  // "124 row 5 seats 867-870 Category 3 690 kr" / "124 row 34 seats 50-52 + row 35 seats 50-52 ..."
+  AB.describeGroup = function (choice) {
+    var first = choice.rows[0][0], prices = [];
+    choice.seats.forEach(function (s) { var kr = AB.kr(s.item.price); if (kr !== null && prices.indexOf(kr) < 0) prices.push(kr); });
+    return first.area + ' ' + choice.rows.map(function (r) { return 'row ' + r[0].row + ' seats ' + r[0].seatNo + '-' + r[r.length - 1].seatNo; }).join(' + ') +
+      (first.item.category ? ' ' + first.item.category : '') + (prices.length ? ' ' + prices.sort(function (a, b) { return a - b; }).join('/') + ' kr' : '');
   };
   AB.describeSeats = function (seats, max) {
     max = max || 6;
@@ -364,6 +489,34 @@
   }
   function getJSON(k) { try { return JSON.parse(store.get(k, 'null')); } catch (e) { return null; } }
   function setJSON(k, v) { if (v) store.set(k, JSON.stringify(v)); else store.del(k); }
+  function matches() {   // the code's MATCHES plus the one set from the overlay's Match button
+    var out = {}, k, saved = getJSON('matches') || {};
+    for (k in AB.MATCHES) out[k] = AB.MATCHES[k];
+    for (k in saved) out[k] = saved[k];
+    return out;
+  }
+  function rememberFar(key) {   // a multi-row group the seat map showed apart: never pick it again
+    var l = getJSON('farKeys') || [];
+    if (l.indexOf(key) < 0) l.push(key);
+    setJSON('farKeys', l.slice(-30));
+  }
+  function seatPoint(f) {   // a seat feature's position on the map (OpenLayers geometry), or null
+    try {
+      var g = f && f.geometry; if (!g) return null;
+      if (typeof g.x === 'number' && typeof g.y === 'number') return { x: g.x, y: g.y };
+      if (typeof g.getCentroid === 'function') { var c = g.getCentroid(); if (c && typeof c.x === 'number') return { x: c.x, y: c.y }; }
+      var b = g.bounds || (typeof g.getBounds === 'function' ? g.getBounds() : null);
+      if (b) return { x: (b.left + b.right) / 2, y: (b.top + b.bottom) / 2 };
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  function suggestMatchId() {   // the match id on the current page (the match page URL, or a link on the list)
+    var id = AB.parseMatchId(win.location.search);
+    if (id) return id;
+    var links = doc.querySelectorAll('a[href*="performanceId="], a[href*="perfId="]');
+    for (var i = 0; i < links.length; i++) { id = AB.parseMatchId(links[i].getAttribute('href')); if (id) return id; }
+    return '';
+  }
 
   var state = {
     topic: store.get('topic', ''),
@@ -400,14 +553,17 @@
   box.innerHTML = '<div id="ab-status" style="white-space:pre-wrap"></div>' +
     '<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">' +
     '<button id="ab-audio">Arm audio / test alarm</button><button id="ab-toggle"></button>' +
-    '<button id="ab-topic">Topic</button><button id="ab-keep"></button><button id="ab-test"></button><button id="ab-reset">Reset</button></div>';
+    '<button id="ab-match">Match</button><button id="ab-topic">Topic</button><button id="ab-keep"></button><button id="ab-test"></button><button id="ab-reset">Reset</button></div>';
   function mountOverlay() { if (doc.body && !doc.getElementById('autobasket-box')) { doc.body.appendChild(box); wireButtons(); } }
   function render() {
     var el = doc.getElementById('ab-status'); if (!el) return;
     var grab = getJSON('grab');
     var cd = untilMs('reservedAt') ? Math.ceil(untilMs('reservedAt') / 60000) + ' min cooldown after reservation' : '';
+    var ms = matches(), mk = Object.keys(ms);
     el.textContent =
       'NFF auto-basket ' + AB.VERSION + (state.armed ? '  ARMED' : '  DRY RUN (no reservation)') + '\n' +
+      'match: ' + (mk.length ? mk.map(function (k) { return ms[k] + ' (' + k + ')'; }).join(', ') : 'NOT SET - press Match') + '\n' +
+      'takes: 4-8 together (5 only to avoid a lone seat) (one row, or rows behind each other)\n' +
       'page: ' + state.mode + '   topic: ' + (state.topic ? state.topic.slice(0, 6) + '...' : 'NOT SET') + '   ntfy: ' + state.sseState + '\n' +
       'this tab: ' + (state.leader ? 'active' : 'standby') + '   login: ' + loggedIn() + '   audio: ' + (state.audio ? 'armed' : 'NOT ARMED') + '\n' +
       'poll: ' + state.pollLast + '   last alert: ' + state.lastEvent + '\n' +
@@ -425,6 +581,17 @@
     };
     doc.getElementById('ab-toggle').onclick = function () { state.armed = !state.armed; store.set('armed', state.armed ? '1' : '0'); state.lastDry = ''; setAction(state.armed ? 'ARMED' : 'dry run'); };
     doc.getElementById('ab-keep').onclick = function () { state.keepalive = !state.keepalive; store.set('keepalive', state.keepalive ? '1' : '0'); render(); };
+    doc.getElementById('ab-match').onclick = function () {
+      var cur = Object.keys(getJSON('matches') || {})[0] || suggestMatchId();
+      var t = win.prompt('Match to watch: paste the match page URL (with performanceId= or perfId=) or the id itself. Empty = none.', cur);
+      if (t === null) return;
+      if (!t.trim()) { store.del('matches'); setAction('match cleared'); return; }
+      var id = AB.parseMatchId(t);
+      if (!id) { win.alert('No performanceId/perfId found in that. (A productId is not the match id.)'); return; }
+      var m = {}; m[id] = AB.DEFAULT_MATCH_NAME; setJSON('matches', m);
+      store.del('farKeys'); store.del('grab');
+      setAction('watching match ' + id);
+    };
     doc.getElementById('ab-topic').onclick = function () {
       var t = win.prompt('ntfy topic (same as the watcher\'s NTFY_TOPIC secret):', state.topic);
       if (t !== null) { state.topic = t.trim(); store.set('topic', state.topic); connectNtfy(); }
@@ -434,7 +601,7 @@
       setAction(state.testOnce ? 'TEST MODE armed: the next single ticket will be reserved once (empty the cart afterwards)' : 'test mode off');
     };
     doc.getElementById('ab-reset').onclick = function () {
-      ['reservedAt', 'grab', 'intent', 'testOnce'].forEach(store.del); state.busy = false; state.lastDry = ''; state.testOnce = false; setAction('reset');
+      ['reservedAt', 'grab', 'intent', 'testOnce', 'farKeys'].forEach(store.del); state.busy = false; state.lastDry = ''; state.testOnce = false; setAction('reset');
     };
   }
 
@@ -529,15 +696,15 @@
   // testMode: if no real pair exists but at least one ticket does, return a 1-ticket
   // smoke-test target (test:true). A real pair always takes precedence over the test.
   function targetFor(id, raw, testMode) {
-    var name = AB.MATCHES[id];
+    var name = matches()[id];
     var seats = AB.expandSeats(AB.normalizeItems(raw));
-    var choice = AB.choosePairs(seats, AB.WANT), test = false;
+    var choice = AB.chooseGroup(seats, getJSON('farKeys') || []), test = false;
     if (!choice && testMode && seats.length) { choice = AB.chooseAny(seats, 1); test = true; }
     if (!choice) return null;
     var payload = AB.buildPayload(id, choice.seats);
     var desc = test
       ? 'TEST 1 x ' + name + ' (' + AB.describeSeats(choice.seats) + ')'
-      : choice.count + ' x ' + name + ' (' + AB.describePairs(choice.pairs) + ')';
+      : choice.count + ' x ' + name + ' (' + AB.describeGroup(choice) + ')';
     if (AB.payloadMissing(payload).length) {
       push('urgent', AB.OWN_TITLE_PREFIX + ': check ' + name, name + ' found (' + desc + ') but the listing lacked the ids to reserve. Open the match page.', AB.matchPage(id));
       return null;
@@ -550,7 +717,8 @@
     if (!state.leader || state.busy) { return; }
     if (pageMode() !== 'list') return;
     if (untilMs('reservedAt')) { state.pollLast = hhmm() + ' cooldown'; render(); return; }
-    var ids = Object.keys(AB.MATCHES), found = null, chain = Promise.resolve();
+    var ids = Object.keys(matches()), found = null, chain = Promise.resolve();
+    if (!ids.length) { state.pollLast = hhmm() + ' NO MATCH SET (press Match)'; render(); return; }
     ids.forEach(function (id) {
       chain = chain.then(function () {
         if (found) return;
@@ -579,15 +747,15 @@
   // pushes "buy by hand" once, because the seats are still listed at that moment.
   // Since 25 Sep the cloud watcher is blocked by DataDome (HTTP 403 for non-browser clients),
   // so this tab is the ONLY alarm. Push once per distinct listing when tickets are seen but
-  // no valid 2/4 adjacent set exists (a valid set is handled by act(), which pushes outcomes).
+  // no valid group exists (a valid group is handled by act(), which pushes outcomes).
   function noteSeen(id, raw) {
     var seats = AB.expandSeats(AB.normalizeItems(raw));
     if (!seats.length) { state.seenKey = ''; return; }
     var key = seats.map(function (s) { return String(s.movementId); }).sort().join(',');
     if (state.seenKey === key) return;
     state.seenKey = key;
-    var name = AB.MATCHES[id];
-    var txt = name + ': ' + seats.length + ' ticket(s) listed but no valid 2/4 adjacent set (' + AB.describeSeats(seats) + '). Not reserved. Buy by hand if you want them.';
+    var name = matches()[id];
+    var txt = name + ': ' + seats.length + ' ticket(s) listed but no group of 4-8 together (' + AB.describeSeats(seats) + '). Not reserved. Buy by hand if you want them.';
     setAction(txt); alarm();
     push('high', AB.OWN_TITLE_PREFIX + ': seen ' + name, txt, AB.matchPage(id));
   }
@@ -626,8 +794,10 @@
     var seatSpecs = target.choice.seats.map(function (s) {
       return { mid: s.movementId, row: s.row, seatNo: s.seatNo, area: s.area, blockId: s.item.blockId !== undefined ? s.item.blockId : null };
     });
+    var nRows = target.choice.rows ? target.choice.rows.length : 1;
     setJSON('intent', { pid: target.id, name: target.name, key: target.key, desc: target.desc, queue: [target.payload], got: [], total: 1,
-                        seats: seatSpecs, test: !!target.test, createdAt: Date.now(), status: 'go' });
+                        seats: seatSpecs, rows: nRows, unchecked: nRows > 1,   // cleared once the seat map shows the rows together
+                        test: !!target.test, createdAt: Date.now(), status: 'go' });
     store.del('trace'); tr('grab ' + target.desc + ' (' + seatSpecs.map(AB.seatPos).join(', ') + ') block ' + seatSpecs[0].blockId + ' mids ' + seatSpecs.map(function (s) { return s.mid; }).join('/'));
     setAction((target.test ? 'TEST: ' : '') + 'grabbing ' + target.desc + ' -> entering the queue');
     win.setTimeout(function () { win.location.href = AB.matchPage(target.id); }, 50);
@@ -732,6 +902,12 @@
         var hits = findSeatFeatures(specs), feats = (SM.seatsLayer.features || []);
         tr('seats found ' + hits.length + '/' + specs.length + ' among ' + feats.length + ' features' + (hits.length ? '' : ' (sample: ' + JSON.stringify((feats[0] && feats[0].data && { id: feats[0].data.id, block: feats[0].data.block, row: feats[0].data.row, number: feats[0].data.number, hasResaleSeats: !!feats[0].data.resaleSeats }) || null) + ')'));
         if (hits.length !== specs.length) return false;
+        if ((intent.rows || 1) > 1) {   // rows behind each other? measure on the map before buying
+          var near = AB.rowsNear(hits.map(function (h) { var p = seatPoint(h.feature) || {}; return { row: h.spec.row, seatNo: h.spec.seatNo, x: p.x, y: p.y }; }));
+          tr('rows check: ' + near.why + (near.ok === null ? ' -> going ahead unchecked' : near.ok ? ' -> together' : ' -> APART'));
+          if (near.ok === false) { rememberFar(intent.key); failGrab(intent, 'the rows are not behind each other on the seat map (' + near.why + '), skipping this group'); return 'apart'; }
+          if (near.ok) { intent.unchecked = false; setJSON('intent', intent); }
+        }
         var before = SL.getNbSelectedSeats() || 0;
         return hits.reduce(function (p, h) {
           return p.then(function () {
@@ -904,7 +1080,7 @@
       win.setTimeout(function () { win.location.href = AB.matchPage(intent.pid); }, 150);
       return;
     }
-    succeed(intent.desc, AB.BASKET_PATH, !!intent.test);
+    succeed(intent.desc + (intent.unchecked ? ' [several rows, NOT checked on the map: look before paying]' : ''), AB.BASKET_PATH, !!intent.test);
   }
   // Some seats are in the cart but the next one was refused or gone: stop, tell the user
   // exactly what they hold, and let them decide to pay for those or empty the cart.
@@ -924,7 +1100,7 @@
       store.set('reservedAt', String(Date.now() + AB.TEST_COOLDOWN_MS));
       setAction('TEST OK: ' + desc + ' landed in the cart. EMPTY THE CART now to release it.');
       alarm();
-      push('urgent', AB.OWN_TITLE_PREFIX + ' TEST OK', 'The submit path WORKS: ' + desc + ' landed in the cart. Empty the cart now so the ticket is released. Test mode is off; normal rules (2 or 4 adjacent) resume.', AB.BASKET_PATH);
+      push('urgent', AB.OWN_TITLE_PREFIX + ' TEST OK', 'The submit path WORKS: ' + desc + ' landed in the cart. Empty the cart now so the ticket is released. Test mode is off; normal rules (4-8 together) resume.', AB.BASKET_PATH);
     } else {
       store.set('reservedAt', String(Date.now() + AB.COOLDOWN_MS));
       setAction('RESERVED ' + desc);

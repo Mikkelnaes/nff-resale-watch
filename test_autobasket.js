@@ -97,20 +97,20 @@ t('without pricesSelection the ticket\'s own tariff and realPrice are used', () 
   assert.strictEqual(it.audienceSubCategoryId, 10229708951675);
   assert.strictEqual(it.price, 690000);
 });
-t('two real-shape tickets in the same row form a complete, sendable pair', () => {
-  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 1, row: '5', seat: '844' }), liveItem({ mid: 2, row: '5', seat: '845' })] }));
-  const c = AB.choosePairs(seats);
-  assert.strictEqual(c.count, 2);
-  assert.deepStrictEqual(nos(c), [844, 845]);
+const live = (row, ...seatNos) => seatNos.map((n, i) => liveItem({ mid: Number(row) * 1000 + n, row: String(row), seat: String(n) }));
+const liveSeats = (items) => AB.expandSeats(AB.normalizeItems({ resaleItems: items }));
+t('four real-shape tickets in the same row form a complete, sendable group', () => {
+  const c = AB.chooseGroup(liveSeats(live(5, 867, 868, 869, 870)));
+  assert.strictEqual(c.count, 4);
+  assert.deepStrictEqual(nos(c), [867, 868, 869, 870]);
   const p = AB.buildPayload(10229739913106, c.seats);
   assert.deepStrictEqual(AB.payloadMissing(p), []);
   assert.strictEqual(p.resaleItemData[0].unitAmount, 690000);
-  assert.strictEqual(p.resaleItemData.length, 2, 'one entry per seat');
-  assert.deepStrictEqual(p.resaleItemData.map((d) => d.movementIds[0]), [1, 2]);
+  assert.strictEqual(p.resaleItemData.length, 4, 'one entry per seat');
+  assert.deepStrictEqual(p.resaleItemData.map((d) => d.movementIds[0]), [5867, 5868, 5869, 5870]);
 });
-t('real-shape seats one apart in different rows are not a pair', () => {
-  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 1, row: '5', seat: '844' }), liveItem({ mid: 2, row: '6', seat: '845' })] }));
-  assert.strictEqual(AB.choosePairs(seats), null);
+t('real-shape seats one apart in different rows are not a group', () => {
+  assert.strictEqual(AB.chooseGroup(liveSeats([liveItem({ mid: 1, row: '5', seat: '844' }), liveItem({ mid: 2, row: '6', seat: '845' })])), null);
 });
 t('price displays in kroner (thousandths divided)', () => assert.strictEqual(AB.kr(690000), 690));
 t('empty and malformed input give no items', () => {
@@ -131,71 +131,150 @@ t('nested seats list is expanded with its own numbers', () => {
 });
 t('a line without any id yields no seat', () => assert.strictEqual(seatsFrom([{ price: 450, seatPath: 'B7 / 12 / 5' }]).length, 0));
 
-console.log('# pair selection: never 1 or 3, adjacent only');
+console.log('# group selection: 4-8 together, never 1-3, 5 only to avoid stranding a seat');
 const S = (...seatNos) => seatsFrom(seatNos.map((n, i) => siteItem({ mid: 100 + i, seat: n })));
-t('nothing listed', () => assert.strictEqual(AB.choosePairs([]), null));
-t('one seat is never taken', () => assert.strictEqual(AB.choosePairs(S(5)), null));
-t('two adjacent seats give 2', () => { const c = AB.choosePairs(S(5, 6)); assert.strictEqual(c.count, 2); assert.deepStrictEqual(nos(c), [5, 6]); });
-t('two seats with a gap are not a pair', () => assert.strictEqual(AB.choosePairs(S(5, 7)), null));
-t('two seats in different rows are not a pair', () => {
-  assert.strictEqual(AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5, row: '12' }), siteItem({ mid: 2, seat: 6, row: '13' })])), null);
+const R = (row, ...seatNos) => seatNos.map((n) => siteItem({ mid: Number(row) * 1000 + n, row: String(row), seat: n }));
+const G = (...lists) => AB.chooseGroup(seatsFrom([].concat(...lists)));
+const rowsOf = (c) => c.rows.map((r) => r[0].row + ':' + r.map((s) => s.seatNo).join(','));
+const range = (a, b) => Array.from({ length: b - a + 1 }, (_, i) => a + i);
+t('nothing listed', () => assert.strictEqual(AB.chooseGroup([]), null));
+t('one, two or three seats are never taken', () => {
+  assert.strictEqual(AB.chooseGroup(S(5)), null);
+  assert.strictEqual(AB.chooseGroup(S(5, 6)), null);
+  assert.strictEqual(AB.chooseGroup(S(5, 6, 7)), null);
 });
-t('two seats in different sections with neighbouring numbers are not a pair', () => {
-  assert.strictEqual(AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5, area: 'B7' }), siteItem({ mid: 2, seat: 6, area: 'B8' })])), null);
+t('four in a row give 4', () => { const c = AB.chooseGroup(S(5, 6, 7, 8)); assert.strictEqual(c.count, 4); assert.deepStrictEqual(nos(c), [5, 6, 7, 8]); assert.strictEqual(c.rows.length, 1); });
+t('five in a row give 5 (4 would leave one seat alone)', () => { const c = AB.chooseGroup(S(5, 6, 7, 8, 9)); assert.strictEqual(c.count, 5); assert.strictEqual(c.orphans, 0); });
+for (const n of [6, 7, 8]) {
+  t(n + ' in a row give ' + n, () => { const c = AB.chooseGroup(S(...range(1, n))); assert.strictEqual(c.count, n); assert.deepStrictEqual(nos(c), range(1, n)); });
+}
+t('nine in a row give 7, not 8 (8 would leave one seat alone)', () => {
+  const c = AB.chooseGroup(S(...range(1, 9)));
+  assert.strictEqual(c.count, 7); assert.strictEqual(c.orphans, 0); assert.deepStrictEqual(nos(c), range(1, 7));
 });
-t('three in a row give one pair (2), never 3', () => { const c = AB.choosePairs(S(5, 6, 7)); assert.strictEqual(c.count, 2); assert.deepStrictEqual(nos(c), [5, 6]); });
-t('four in a row give 4', () => { const c = AB.choosePairs(S(5, 6, 7, 8)); assert.strictEqual(c.count, 4); assert.deepStrictEqual(nos(c), [5, 6, 7, 8]); assert.strictEqual(c.pairs.length, 2); });
-t('two pairs in different places give 4', () => {
-  const c = AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5, area: 'B7' }), siteItem({ mid: 2, seat: 6, area: 'B7' }), siteItem({ mid: 3, seat: 20, area: 'C1', row: '3' }), siteItem({ mid: 4, seat: 21, area: 'C1', row: '3' })]));
-  assert.strictEqual(c.count, 4); assert.strictEqual(c.pairs.length, 2);
+t('ten or more in a row give 8 (the most we take), the spare seats together', () => {
+  for (const n of [10, 11, 12, 15]) { const c = AB.chooseGroup(S(...range(1, n))); assert.strictEqual(c.count, 8, 'run ' + n); assert.strictEqual(c.orphans, 0, 'run ' + n); }
 });
-t('five seats: run of three plus a pair elsewhere give 4', () => {
-  const c = AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5 }), siteItem({ mid: 2, seat: 6 }), siteItem({ mid: 3, seat: 7 }), siteItem({ mid: 4, seat: 30, row: '2' }), siteItem({ mid: 5, seat: 31, row: '2' })]));
-  assert.strictEqual(c.count, 4); assert.deepStrictEqual(nos(c), [5, 6, 30, 31]);
+t('seats with a gap are not neighbours', () => assert.strictEqual(AB.chooseGroup(S(1, 2, 4, 5)), null));
+t('two pairs in different blocks are not a group (all seats must sit together now)', () => {
+  assert.strictEqual(G([siteItem({ mid: 1, seat: 5, area: 'B7' }), siteItem({ mid: 2, seat: 6, area: 'B7' }), siteItem({ mid: 3, seat: 5, area: 'C1' }), siteItem({ mid: 4, seat: 6, area: 'C1' })]), null);
 });
-t('six in a row give 4, not 6', () => { const c = AB.choosePairs(S(1, 2, 3, 4, 5, 6)); assert.strictEqual(c.count, 4); assert.deepStrictEqual(nos(c), [1, 2, 3, 4]); });
-t('four in a row are preferred over two separate pairs', () => {
-  const c = AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 1, area: 'A' }), siteItem({ mid: 2, seat: 2, area: 'A' }), siteItem({ mid: 3, seat: 10, area: 'B' }), siteItem({ mid: 4, seat: 11, area: 'B' }), siteItem({ mid: 5, seat: 12, area: 'B' }), siteItem({ mid: 6, seat: 13, area: 'B' })]));
-  assert.deepStrictEqual(c.seats.map((s) => s.area), ['B', 'B', 'B', 'B']);
+t('two pairs in rows far apart in the same block are not a group', () => assert.strictEqual(G(R(12, 5, 6), R(20, 5, 6)), null));
+t('2 + 2 directly behind each other give 4', () => {
+  const c = G(R(34, 50, 51), R(35, 50, 51));
+  assert.strictEqual(c.count, 4); assert.deepStrictEqual(rowsOf(c), ['34:50,51', '35:50,51']);
+});
+t('the example: row 34 seats 50-52 and row 35 seats 50-52 give 6', () => {
+  const c = G(R(34, 50, 51, 52), R(35, 50, 51, 52));
+  assert.strictEqual(c.count, 6); assert.deepStrictEqual(rowsOf(c), ['34:50,51,52', '35:50,51,52']);
+});
+t('"or nearby": row 35 shifted two seats still counts', () => assert.strictEqual(G(R(34, 50, 51, 52), R(35, 52, 53, 54)).count, 6));
+t('rows behind each other but far apart in seat numbers are not a group', () => assert.strictEqual(G(R(34, 50, 51), R(35, 80, 81)), null));
+t('3 + 2 behind each other give 5 (4 would strand a seat)', () => {
+  const c = G(R(34, 50, 51, 52), R(35, 50, 51));
+  assert.strictEqual(c.count, 5); assert.strictEqual(c.rows.length, 2); assert.strictEqual(c.orphans, 0);
+});
+t('5 is never taken when it would itself strand a seat', () => {
+  assert.strictEqual(AB.fitRuns([S(1, 2, 3, 4, 5, 6)]).count, 6);
+  assert.strictEqual(AB.ALLOWED.indexOf(5), -1);
+});
+t('a single seat in the row behind is not used', () => assert.strictEqual(G(R(34, 50, 51, 52), R(35, 51)), null));
+t('three rows of 2 give 6', () => assert.strictEqual(G(R(10, 5, 6), R(11, 5, 6), R(12, 5, 6)).count, 6));
+t('three rows of 4 give 8 at most', () => {
+  const c = G(R(10, 5, 6, 7, 8), R(11, 5, 6, 7, 8), R(12, 5, 6, 7, 8));
+  assert.strictEqual(c.count, 8); assert.ok(c.rows.every((r) => r.length >= 2));
+});
+t('four rows are not chained (at most three)', () => {
+  const c = G(R(10, 5, 6), R(11, 5, 6), R(12, 5, 6), R(13, 5, 6));
+  assert.strictEqual(c.count, 6); assert.strictEqual(c.rows.length, 3);
+});
+t('same count: one row beats rows behind each other', () => {
+  const c = G(R(1, 10, 11, 12, 13), R(20, 5, 6), R(21, 5, 6));
+  assert.strictEqual(c.count, 4); assert.deepStrictEqual(rowsOf(c), ['1:10,11,12,13']);
+});
+t('more seats beat one row: 6 over two rows beat 4 in one row', () => {
+  const c = G(R(1, 10, 11, 12, 13), R(20, 5, 6, 7), R(21, 5, 6, 7));
+  assert.strictEqual(c.count, 6); assert.strictEqual(c.rows.length, 2);
+});
+t('4 + 4 behind each other give 8, not just the 4 in one row', () => assert.strictEqual(G(R(34, 50, 51, 52, 53), R(35, 50, 51, 52, 53)).count, 8));
+t('many seats in two rows: 6 + 6 give 8 as 4 + 4, behind each other, no lone seat', () => {
+  const c = G(R(34, ...range(40, 45)), R(35, ...range(40, 45)));
+  assert.strictEqual(c.count, 8);
+  assert.deepStrictEqual(c.rows.map((r) => r.length), [4, 4]);
+  assert.strictEqual(c.orphans, 0);
+  assert.ok(c.spread <= 1, 'spread ' + c.spread);
+});
+t('a full row of 8 beats 4 + 4 over two rows', () => {
+  const c = G(R(34, ...range(40, 49)), R(35, ...range(40, 49)));
+  assert.strictEqual(c.count, 8); assert.strictEqual(c.rows.length, 1);
+});
+t('same count: the cheaper group wins', () => {
+  const c = AB.chooseGroup(seatsFrom([...R(1, 1, 2, 3, 4).map((x) => Object.assign(x, { price: 900 })), ...R(2, 11, 12, 13, 14)]));
+  assert.strictEqual(c.seats[0].row, '2');
 });
 t('unnumbered tickets are never taken', () => {
-  assert.strictEqual(AB.choosePairs(seatsFrom([{ movementIds: [1, 2, 3, 4], availableQuantity: 4, seatCategoryId: 1, audienceSubCategoryId: 1, price: 1 }])), null);
+  assert.strictEqual(AB.chooseGroup(seatsFrom([{ movementIds: [1, 2, 3, 4], availableQuantity: 4, seatCategoryId: 1, audienceSubCategoryId: 1, price: 1 }])), null);
 });
-t('duplicate listing of the same seat does not form a pair with itself', () => assert.strictEqual(AB.choosePairs(S(5, 5)), null));
-t('a want list of [2] takes one pair even when four are there', () => assert.strictEqual(AB.choosePairs(S(5, 6, 7, 8), [2]).count, 2));
+t('duplicate listings of the same seat do not count twice', () => assert.strictEqual(AB.chooseGroup(S(5, 5, 6, 7)), null));
+t('a group the seat map showed apart (skip list) is passed over for the next best', () => {
+  const seats = seatsFrom([...R(34, 50, 51, 52), ...R(35, 50, 51, 52), ...R(3, 1, 2, 3, 4)]);
+  const first = AB.chooseGroup(seats);
+  assert.strictEqual(first.count, 6);
+  const next = AB.chooseGroup(seats, [AB.seatKey(first)]);
+  assert.strictEqual(next.count, 4); assert.strictEqual(next.seats[0].row, '3');
+});
 t('ignored movement ids (known unbuyable listing) are never chosen', () => {
   const old = AB.IGNORE_MOVEMENTS; AB.IGNORE_MOVEMENTS = ['100', '101'];
   try {
-    assert.strictEqual(AB.choosePairs(S(5, 6)), null, 'the ignored pair itself');
-    const c = AB.choosePairs(S(5, 6, 7, 8));
-    assert.strictEqual(c.count, 2, 'the remaining two seats still form a pair');
-    assert.deepStrictEqual(nos(c), [7, 8]);
+    assert.strictEqual(AB.chooseGroup(S(5, 6, 7, 8)), null, 'only 7-8 left');
+    const c = AB.chooseGroup(S(5, 6, 7, 8, 9, 10));
+    assert.deepStrictEqual(nos(c), [7, 8, 9, 10]);
   } finally { AB.IGNORE_MOVEMENTS = old; }
-});
-t('the real ghost pair is on the ignore list', () => {
-  assert.ok(AB.IGNORE_MOVEMENTS.indexOf('10229785497024') >= 0 && AB.IGNORE_MOVEMENTS.indexOf('10229785497025') >= 0);
 });
 t('ignored seat positions (known unbuyable seats) are never chosen', () => {
   const old = AB.IGNORE_SEATS; AB.IGNORE_SEATS = ['B7 r12 s5', 'B7 r12 s6'];
   try {
-    assert.strictEqual(AB.choosePairs(S(5, 6)), null, 'the ignored pair itself');
-    const c = AB.choosePairs(S(5, 6, 7, 8));
-    assert.strictEqual(c.count, 2, 'the remaining two seats still form a pair');
-    assert.deepStrictEqual(nos(c), [7, 8]);
+    assert.strictEqual(AB.chooseGroup(S(5, 6, 7, 8)), null);
+    assert.deepStrictEqual(nos(AB.chooseGroup(S(5, 6, 7, 8, 9, 10))), [7, 8, 9, 10]);
   } finally { AB.IGNORE_SEATS = old; }
 });
-t('the 25 Sep Portugal ghost pair is on the seat ignore list', () => {
-  assert.deepStrictEqual(AB.IGNORE_SEATS, ['412 r31 s479', '412 r31 s480']);
+t('the September ghost lists (other matches) are cleared', () => {
+  assert.deepStrictEqual(AB.IGNORE_SEATS, []); assert.deepStrictEqual(AB.IGNORE_MOVEMENTS, []);
 });
 t('seatPos prints the trace / ignore-list format', () => assert.strictEqual(AB.seatPos({ area: '412', row: '31', seatNo: 479 }), '412 r31 s479'));
 t('excluded sections are skipped', () => {
   const old = AB.EXCLUDE_AREA; AB.EXCLUDE_AREA = /^B7$/;
-  try { assert.strictEqual(AB.choosePairs(S(5, 6)), null); } finally { AB.EXCLUDE_AREA = old; }
+  try { assert.strictEqual(AB.chooseGroup(S(5, 6, 7, 8)), null); } finally { AB.EXCLUDE_AREA = old; }
 });
+
+console.log('# seat-map check: are the rows really behind each other?');
+const P = (row, seatNo, x, y) => ({ row: String(row), seatNo, x, y });
+t('rows straight behind each other are together', () => {
+  const r = AB.rowsNear([P(34, 50, 0, 0), P(34, 51, 10, 0), P(34, 52, 20, 0), P(35, 50, 0, 12), P(35, 51, 10, 12), P(35, 52, 20, 12)]);
+  assert.strictEqual(r.ok, true, r.why);
+});
+t('rows shifted a couple of seats are still together', () => {
+  assert.strictEqual(AB.rowsNear([P(34, 50, 0, 0), P(34, 51, 10, 0), P(35, 60, 20, 12), P(35, 61, 30, 12)]).ok, true);
+});
+t('rows far apart on the map are apart, even with matching seat numbers', () => {
+  const r = AB.rowsNear([P(34, 50, 0, 0), P(34, 51, 10, 0), P(35, 50, 200, 12), P(35, 51, 210, 12)]);
+  assert.strictEqual(r.ok, false); assert.ok(/seat widths apart/.test(r.why), r.why);
+});
+t('missing coordinates cannot be measured (null, not a verdict)', () => {
+  assert.strictEqual(AB.rowsNear([P(34, 50, 0, 0), P(35, 50, undefined, undefined)]).ok, null);
+  assert.strictEqual(AB.rowsNear([]).ok, null);
+});
+
+console.log('# match id from a pasted URL');
+t('performanceId from a resale match URL', () => assert.strictEqual(AB.parseMatchId('https://resale.fotball.no/selection/resale/item?performanceId=10229739913107&checkResaleAvailability=true'), '10229739913107'));
+t('perfId from a main-shop URL', () => assert.strictEqual(AB.parseMatchId('https://billett.fotball.no/selection/event/seat?perfId=10229739913199&lang=en'), '10229739913199'));
+t('a bare id', () => assert.strictEqual(AB.parseMatchId('  10229739913199 '), '10229739913199'));
+t('a productId is not a match id', () => assert.strictEqual(AB.parseMatchId('https://billett.fotball.no/selection/event/date?productId=10229739619905'), null));
+t('the 14 Nov match is configured', () => assert.deepStrictEqual(AB.MATCHES, { '10229739913108': 'NL 14 Nov' }));
 
 console.log('# basket request');
 t('payload is one entry PER SEAT (quantity 1 each), as the seated page posts it', () => {
-  const c = AB.choosePairs(S(5, 6, 7, 8));
+  const c = AB.chooseGroup(S(5, 6, 7, 8));
   const p = AB.buildPayload('10229739913106', c.seats);
   assert.strictEqual(p.performanceId, 10229739913106);
   assert.strictEqual(p.resaleItemData.length, 4);
@@ -205,7 +284,7 @@ t('payload is one entry PER SEAT (quantity 1 each), as the seated page posts it'
   assert.deepStrictEqual(AB.payloadMissing(p), []);
 });
 t('pairs with different prices become separate entries', () => {
-  const c = AB.choosePairs(seatsFrom([siteItem({ mid: 1, seat: 5 }), siteItem({ mid: 2, seat: 6 }), siteItem({ mid: 3, seat: 20, row: '3', price: 700, cat: 502 }), siteItem({ mid: 4, seat: 21, row: '3', price: 700, cat: 502 })]));
+  const c = { seats: seatsFrom([siteItem({ mid: 1, seat: 5 }), siteItem({ mid: 2, seat: 6 }), siteItem({ mid: 3, seat: 20, row: '3', price: 700, cat: 502 }), siteItem({ mid: 4, seat: 21, row: '3', price: 700, cat: 502 })]) };
   const p = AB.buildPayload(1, c.seats);
   assert.strictEqual(p.resaleItemData.length, 4);
   assert.deepStrictEqual(p.resaleItemData.map((d) => d.quantity), [1, 1, 1, 1]);
@@ -214,7 +293,7 @@ t('pairs with different prices become separate entries', () => {
 t('fixture-shaped listing is recognised as a pair but the request is reported incomplete, not sent', () => {
   const raw = JSON.parse(fs.readFileSync(__dirname + '/test-fixtures/items-hit.json', 'utf8'));
   const seats = AB.expandSeats(AB.normalizeItems(raw));
-  const c = AB.choosePairs(seats);
+  const c = ({ count: seats.length, seats });
   assert.strictEqual(c.count, 2);
   const missing = AB.payloadMissing(AB.buildPayload(10229739913106, c.seats));
   assert.deepStrictEqual(missing.sort(), ['audienceSubCategoryId', 'seatCategoryId']);
@@ -222,7 +301,7 @@ t('fixture-shaped listing is recognised as a pair but the request is reported in
 t('empty payload is incomplete', () => assert.deepStrictEqual(AB.payloadMissing({ performanceId: 1, resaleItemData: [] }), ['resaleItemData']));
 t('form body mirrors the match page fields and carries the csrf', () => {
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 111, row: '5', seat: '844' }), liveItem({ mid: 112, row: '5', seat: '845' })] }));
-  const body = AB.buildFormBody(AB.buildPayload(10229739913106, AB.choosePairs(seats).seats), 'tok-123');
+  const body = AB.buildFormBody(AB.buildPayload(10229739913106, ({ count: seats.length, seats }).seats), 'tok-123');
   assert.ok(body.indexOf('performanceId=10229739913106') === 0, body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.key=NFF_RESALE_') > 0, 'form carries the row key: ' + body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.audienceSubCategoryId=10229709001571') > 0, 'form carries the Resale tariff: ' + body);
@@ -242,7 +321,7 @@ t('two rows (different keys and prices) make two form entries', () => {
     liveItem({ mid: 1, row: '5', seat: '10' }), liveItem({ mid: 2, row: '5', seat: '11' }),
     Object.assign(liveItem({ mid: 3, row: '9', seat: '20', key: 'NFF_RESALE_ROW_B' }), dear),
     Object.assign(liveItem({ mid: 4, row: '9', seat: '21', key: 'NFF_RESALE_ROW_B' }), dear)] }));
-  const payload = AB.buildPayload(1, AB.choosePairs(seats).seats);
+  const payload = AB.buildPayload(1, ({ count: seats.length, seats }).seats);
   assert.strictEqual(payload.resaleItemData.length, 4, 'two pairs = four seat entries');
   const body = AB.buildFormBody(payload, 'x');
   assert.ok(body.indexOf('resaleItemData%5B2%5D.unitAmount=990000') > 0, body);
@@ -254,7 +333,7 @@ t('the real 17 Sep Portugal pair (one key, two seats) becomes TWO entries of qua
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [
     Object.assign(liveItem({ mid: 10229796417629, row: '27', seat: '417', key: k, block: '411' }), { seatCategoryId: 10229721164073, realPrice: 890000, pricesSelection: [{ audienceSubCatId: 10229709001571, amount: 890000 }] }),
     Object.assign(liveItem({ mid: 10229796417630, row: '27', seat: '418', key: k, block: '411' }), { seatCategoryId: 10229721164073, realPrice: 890000, pricesSelection: [{ audienceSubCatId: 10229709001571, amount: 890000 }] })] }));
-  const c = AB.choosePairs(seats);
+  const c = ({ count: seats.length, seats });
   assert.strictEqual(c.count, 2);
   const p = AB.buildPayload(10229739913107, c.seats);
   assert.strictEqual(p.resaleItemData.length, 2);
@@ -266,7 +345,7 @@ t('a null priceLevelId is OMITTED from the form (the proven 17 Sep single carrie
   const k = 'NFF_RESALE_ROW_X';
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [
     liveItem({ mid: 1, row: '5', seat: '10', key: k }), liveItem({ mid: 2, row: '5', seat: '11', key: k })] }));
-  const body = AB.buildFormBody(AB.buildPayload(1, AB.choosePairs(seats).seats), 'tok');
+  const body = AB.buildFormBody(AB.buildPayload(1, ({ count: seats.length, seats }).seats), 'tok');
   assert.strictEqual(body.indexOf('priceLevelId'), -1, 'no empty priceLevelId field: ' + body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.key=NFF_RESALE_ROW_X') > 0, body);
   assert.ok(body.indexOf('resaleItemData%5B0%5D.seatCategoryId=') > 0, body);
@@ -291,7 +370,7 @@ t('chooseAny picks one ticket with an id, numbered seats first', () => {
 t('chooseAny returns null when nothing has an id', () => assert.strictEqual(AB.chooseAny([], 1), null));
 t('a single real listing gives no pair but is a valid 1-ticket test target', () => {
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 5, row: '5', seat: '844' })] }));
-  assert.strictEqual(AB.choosePairs(seats), null, 'never 1 in normal mode');
+  assert.strictEqual(AB.chooseGroup(seats), null, 'never 1 in normal mode');
   const c = AB.chooseAny(seats, 1);
   const p = AB.buildPayload(10229739913106, c.seats);
   assert.strictEqual(p.resaleItemData[0].quantity, 1);
@@ -301,7 +380,7 @@ console.log('# one seat per submit: a pair becomes a queue of single-seat payloa
 t('singlePayloads turns a chosen pair into two single-seat payloads, each complete', () => {
   const k = 'NFF_RESALE_ROW_Q';
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 501, row: '60', seat: '975', key: k }), liveItem({ mid: 502, row: '60', seat: '976', key: k })] }));
-  const c = AB.choosePairs(seats);
+  const c = ({ count: seats.length, seats });
   const q = AB.singlePayloads(10229739913106, c.seats);
   assert.strictEqual(q.length, 2);
   q.forEach((p) => {
@@ -314,7 +393,7 @@ t('singlePayloads turns a chosen pair into two single-seat payloads, each comple
   assert.deepStrictEqual(q.map((p) => p.resaleItemData[0].movementIds[0]), [501, 502]);
 });
 t('singlePayloads for four seats gives four submits in seat order', () => {
-  const c = AB.choosePairs(S(5, 6, 7, 8));
+  const c = AB.chooseGroup(S(5, 6, 7, 8));
   const q = AB.singlePayloads(1, c.seats);
   assert.strictEqual(q.length, 4);
   assert.deepStrictEqual(q.map((p) => p.resaleItemData[0].movementIds[0]), [100, 101, 102, 103]);
@@ -325,13 +404,18 @@ t('checkout steps count as a successful landing', () => {
 });
 
 console.log('# texts');
-t('pair description names section, row, seats, category and price', () => {
-  const c = AB.choosePairs(S(5, 6));
-  assert.strictEqual(AB.describePairs(c.pairs), 'B7 row 12 seats 5-6 Kategori 2 450 kr');
+t('group description names section, row, seats, category and price', () => {
+  assert.strictEqual(AB.describeGroup(AB.chooseGroup(S(5, 6, 7, 8))), 'B7 row 12 seats 5-8 Kategori 2 450 kr');
 });
-t('pair description shows kroner for a real thousandths price', () => {
-  const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 1, row: '5', seat: '844' }), liveItem({ mid: 2, row: '5', seat: '845' })] }));
-  assert.strictEqual(AB.describePairs(AB.choosePairs(seats).pairs), '124 row 5 seats 844-845 Category 3 690 kr');
+t('group description shows kroner for a real thousandths price', () => {
+  assert.strictEqual(AB.describeGroup(AB.chooseGroup(liveSeats(live(5, 867, 868, 869, 870)))), '124 row 5 seats 867-870 Category 3 690 kr');
+});
+t('a multi-row group is described row by row', () => {
+  assert.strictEqual(AB.describeGroup(G(R(34, 50, 51, 52), R(35, 50, 51, 52))), 'B7 row 34 seats 50-52 + row 35 seats 50-52 Kategori 2 450 kr');
+});
+t('mixed prices are all shown', () => {
+  const c = AB.chooseGroup(seatsFrom([...R(5, 1, 2), ...R(5, 3, 4).map((x) => Object.assign(x, { price: 700 }))]));
+  assert.ok(AB.describeGroup(c).endsWith('450/700 kr'), AB.describeGroup(c));
 });
 t('seat description caps the list', () => {
   const d = AB.describeSeats(S(1, 3, 5, 7, 9, 11, 13, 15));
@@ -357,7 +441,7 @@ t('a fresh intent is fresh, an old one is not', () => {
 });
 t('seat key is stable and identifies the exact ticket set', () => {
   const seats = AB.expandSeats(AB.normalizeItems({ resaleItems: [liveItem({ mid: 22, row: '5', seat: '844' }), liveItem({ mid: 11, row: '5', seat: '845' })] }));
-  assert.strictEqual(AB.seatKey(AB.choosePairs(seats)), '11,22');
+  assert.strictEqual(AB.seatKey({ seats }), '11,22');
   assert.strictEqual(AB.seatKey(null), '');
 });
 
