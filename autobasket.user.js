@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.5.0
+// @version      0.5.1
 // @description  Watches NFF resale from your own logged-in browser, and when 4-8 seats together appear for the chosen match it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -44,7 +44,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.5.0',
+    VERSION: '0.5.1',
     // performanceId -> name (14 Nov 2026, Ullevaal; link from the resale list, 12 Nov). The overlay's
     // "Match" button can add another one (stored in this browser).
     MATCHES: { '10229739913108': 'NL 14 Nov' },
@@ -456,6 +456,47 @@
     });
     return d.slice(0, max).join('; ') + (d.length > max ? ' +' + (d.length - max) + ' more' : '');
   };
+  // EVERY listed seat, sorted and grouped per block and row, so a "seen" push can be checked by
+  // eye: "103 r12 s77,90 990; 409 r26 s344 690; ? unnumbered x2". Capped by length (ntfy turns a
+  // message over 4096 bytes into an attachment).
+  AB.describeAll = function (seats, maxChars) {
+    maxChars = maxChars || 3000;
+    var rows = {}, unnumbered = 0;
+    seats.forEach(function (s) {
+      if (s.seatNo === null || s.area === null || s.row === null) { unnumbered++; return; }
+      var k = s.area + ' r' + s.row;
+      (rows[k] = rows[k] || { area: String(s.area), row: s.row, seats: [], kr: {} }).seats.push(s.seatNo);
+      var kr = AB.kr(s.item.price); if (kr !== null) rows[k].kr[kr] = 1;
+    });
+    var parts = Object.keys(rows).map(function (k) { return rows[k]; }).sort(function (a, b) {
+      return a.area.localeCompare(b.area, undefined, { numeric: true }) || (Number(a.row) - Number(b.row)) || String(a.row).localeCompare(String(b.row));
+    }).map(function (r) {
+      var nos = r.seats.sort(function (a, b) { return a - b; }).filter(function (n, i, a) { return i === 0 || a[i - 1] !== n; });
+      return r.area + ' r' + r.row + ' s' + nos.join(',') + (Object.keys(r.kr).length ? ' ' + Object.keys(r.kr).join('/') : '');
+    });
+    if (unnumbered) parts.push('? unnumbered x' + unnumbered);
+    var out = '', i;
+    for (i = 0; i < parts.length; i++) {
+      var next = (out ? out + '; ' : '') + parts[i];
+      if (next.length > maxChars) break;
+      out = next;
+    }
+    return out + (i < parts.length ? ' +' + (parts.length - i) + ' more rows' : '');
+  };
+  // The most seats sitting together in one row (whatever the rules), e.g. {n: 2, desc: "103 r12 s89-90"}.
+  AB.mostTogether = function (seats) {
+    var rows = {}, best = { n: 0, desc: '-' };
+    seats.forEach(function (s) {
+      if (s.seatNo === null || s.area === null || s.row === null) return;
+      var k = s.area + ' r' + s.row; (rows[k] = rows[k] || []).push(s);
+    });
+    Object.keys(rows).sort().forEach(function (k) {
+      runsOf(rows[k]).forEach(function (run) {
+        if (run.length > best.n) best = { n: run.length, desc: k + ' s' + run[0].seatNo + (run.length > 1 ? '-' + run[run.length - 1].seatNo : '') };
+      });
+    });
+    return best;
+  };
 
   // ---- page + intent (state machine across the queue navigation) -----------------
   AB.pageMode = function (pathname, title) {
@@ -568,7 +609,7 @@
       'this tab: ' + (state.leader ? 'active' : 'standby') + '   login: ' + loggedIn() + '   audio: ' + (state.audio ? 'armed' : 'NOT ARMED') + '\n' +
       'poll: ' + state.pollLast + '   last alert: ' + state.lastEvent + '\n' +
       'last action: ' + state.lastAction + (grab ? '\ntarget: ' + grab.key + ' (try ' + grab.tries + '/' + AB.MAX_TRIES + ')' : '') + (cd ? '\n' + cd : '') +
-      (state.testOnce ? '\nTEST MODE: next single ticket is reserved once to prove the path (a real pair still wins)' : '');
+      (state.testOnce ? '\nTEST MODE: next single ticket is reserved once to prove the path (a real group still wins)' : '');
     var tg = doc.getElementById('ab-toggle'); if (tg) tg.textContent = state.armed ? 'Switch to dry run' : 'ARM';
     var kp = doc.getElementById('ab-keep'); if (kp) kp.textContent = state.keepalive ? 'Keepalive off' : 'Keepalive on';
     var tb = doc.getElementById('ab-test'); if (tb) tb.textContent = state.testOnce ? 'Cancel test' : 'Test on next single';
@@ -755,7 +796,9 @@
     if (state.seenKey === key) return;
     state.seenKey = key;
     var name = matches()[id];
-    var txt = name + ': ' + seats.length + ' ticket(s) listed but no group of 4-8 together (' + AB.describeSeats(seats) + '). Not reserved. Buy by hand if you want them.';
+    var most = AB.mostTogether(seats);
+    var txt = name + ': ' + seats.length + ' ticket(s) listed, no group of 4-8 together, not reserved. Most together in one row: ' +
+      most.n + ' (' + most.desc + '). All: ' + AB.describeAll(seats) + '. Buy by hand if you want them.';
     setAction(txt); alarm();
     push('high', AB.OWN_TITLE_PREFIX + ': seen ' + name, txt, AB.matchPage(id));
   }
@@ -813,8 +856,25 @@
     if (intent.status === 'submitting') { checkPostSubmit(); return; }
     // The shop's generic error page shares the item URL prefix: recognise it before anything else.
     var bodyText = (doc.body && doc.body.innerText || '');
-    if (/Error Page|^Feil\b/i.test(doc.title) || /unable to process your request|kan dessverre ikke behandle/i.test(bodyText)) {
-      return failGrab(intent, 'landed on the shop error page before selecting (' + win.location.pathname + ')');
+    var byTitle = /Error Page|^Feil\b/i.test(doc.title), byText = /unable to process your request|kan dessverre ikke behandle/i.test(bodyText);
+    if (byTitle || byText) {
+      // 12 Nov: the test single hit this and the push said nothing more. Say exactly what the
+      // page was, how long after the grab, and whether our seats are STILL listed: gone = someone
+      // was faster; still listed = NFF refused us (a ghost, or the flow changed).
+      var nav = null; try { nav = win.performance.getEntriesByType('navigation')[0]; } catch (e) { /* ignore */ }
+      var info = 'url ' + win.location.pathname + win.location.search + ', title "' + doc.title + '", matched ' + (byTitle ? 'title' : 'text') +
+        ', ' + Math.round((now - intent.createdAt) / 1000) + ' s after the grab' + (nav ? ', redirects ' + nav.redirectCount + ', http ' + (nav.responseStatus || '?') : '') +
+        ', page says: "' + (bodyText || (doc.body && doc.body.textContent) || '').split('NFF auto-basket ')[0].replace(/\s+/g, ' ').trim().slice(0, 220) + '"';
+      var mids = (intent.seats || []).map(function (s) { return String(s.mid); });
+      var check = new Promise(function (resolve) {
+        win.setTimeout(function () { resolve('listing check timed out'); }, 5000);
+        fetchItems(intent.pid).then(function (raw) {
+          var listed = {}; AB.expandSeats(AB.normalizeItems(raw)).forEach(function (s) { listed[String(s.movementId)] = 1; });
+          var still = mids.filter(function (m) { return listed[m]; }).length;
+          resolve(still === mids.length ? 'our seat(s) STILL LISTED -> NFF refused us' : still === 0 ? 'our seat(s) GONE from the list -> someone was faster' : still + '/' + mids.length + ' of our seats still listed');
+        }, function (err) { resolve('listing check failed: ' + err); });
+      });
+      return check.then(function (verdict) { failGrab(intent, 'landed on the shop error page before selecting: ' + verdict + '; ' + info); });
     }
     var pid = String(intent.pid);
     if (win.location.search.indexOf('performanceId=' + pid) < 0) { tr('item page for another match, ignoring'); return; }

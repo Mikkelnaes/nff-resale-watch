@@ -417,6 +417,23 @@ t('mixed prices are all shown', () => {
   const c = AB.chooseGroup(seatsFrom([...R(5, 1, 2), ...R(5, 3, 4).map((x) => Object.assign(x, { price: 700 }))]));
   assert.ok(AB.describeGroup(c).endsWith('450/700 kr'), AB.describeGroup(c));
 });
+t('describeAll lists EVERY seat, sorted and grouped per block and row (12 Nov: 24 of 30 were hidden)', () => {
+  const seats = seatsFrom([
+    siteItem({ mid: 1, area: '409', row: '26', seat: 344, price: 690 }), siteItem({ mid: 2, area: '103', row: '12', seat: 90, price: 990 }),
+    siteItem({ mid: 3, area: '103', row: '8', seat: 70, price: 990 }), siteItem({ mid: 4, area: '103', row: '12', seat: 77, price: 990 }),
+    { movementIds: [9], seatCategoryId: 1, audienceSubCategoryId: 1, price: 1 }]);
+  assert.strictEqual(AB.describeAll(seats), '103 r8 s70 990; 103 r12 s77,90 990; 409 r26 s344 690; ? unnumbered x1');
+});
+t('describeAll stays under the ntfy size limit', () => {
+  const many = seatsFrom(range(1, 400).map((n) => siteItem({ mid: n, area: String(100 + (n % 40)), row: String(n % 30), seat: n })));
+  const d = AB.describeAll(many);
+  assert.ok(d.length < 3100, 'length ' + d.length); assert.ok(/more rows$/.test(d), d.slice(-40));
+});
+t('mostTogether reports the biggest run in one row', () => {
+  const m = AB.mostTogether(seatsFrom([...R(12, 77, 89, 90), ...R(8, 70)]));
+  assert.deepStrictEqual(m, { n: 2, desc: 'B7 r12 s89-90' });
+  assert.deepStrictEqual(AB.mostTogether([]), { n: 0, desc: '-' });
+});
 t('seat description caps the list', () => {
   const d = AB.describeSeats(S(1, 3, 5, 7, 9, 11, 13, 15));
   assert.ok(d.endsWith('+2 more'), d);
