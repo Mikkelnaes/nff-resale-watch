@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.5.1
+// @version      0.5.2
 // @description  Watches NFF resale from your own logged-in browser, and when 4-8 seats together appear for the chosen match it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -17,7 +17,7 @@
   passes the queue. So this script does what a human does, but instantly:
 
   1. DETECT fast. On the resale list page it reads the Denmark and Portugal listings every
-     POLL_MS (3 s) from your admitted session, far faster than the 30 s cloud watcher. The
+     1.2-1.8 s (backing off at the first sign of the bot wall) from your admitted session. The
      ntfy alert is a secondary nudge to poll immediately.
   2. GRAB via a real navigation. When 2 or 4 adjacent seats are found it stores the intent
      and navigates the tab to the match page, entering the queue for real. When the page
@@ -44,7 +44,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.5.1',
+    VERSION: '0.5.2',
     // performanceId -> name (14 Nov 2026, Ullevaal; link from the resale list, 12 Nov). The overlay's
     // "Match" button can add another one (stored in this browser).
     MATCHES: { '10229739913108': 'NL 14 Nov' },
@@ -63,7 +63,19 @@
     IGNORE_SEATS: [],
     SEATMAP_WAIT_MS: 8000,        // wait for the seat map (SeatMap/SeatList) to initialise on the match page
     SEATS_WAIT_MS: 10000,         // wait for our seats to be loaded into the map after zooming to the block
-    POLL_MS: 3000,                // in-browser listing poll interval
+    // Polling: every 1.2-1.8 s (random, so it does not tick like a machine). The first sign of
+    // NFF's bot wall (DataDome: HTTP 403/429, a captcha page, HTML instead of JSON) pauses
+    // polling for BLOCK_PAUSE_MS, then polls at the old safe 3 s for SLOW_FOR_MS, and pushes once.
+    POLL_MS: 1500,
+    POLL_JITTER_MS: 300,
+    SLOW_POLL_MS: 3000,
+    BLOCK_PAUSE_MS: 60 * 1000,
+    SLOW_FOR_MS: 10 * 60 * 1000,
+    // Seats "in someone else's basket" stay listed (12 Nov: twice). Such a miss is not a failure:
+    // re-check every HELD_RETRY_MS without spending tries, until the hold runs out (~15 min) or
+    // HELD_MAX_MS has passed.
+    HELD_RETRY_MS: 20 * 1000,
+    HELD_MAX_MS: 20 * 60 * 1000,
     COOLDOWN_MS: 20 * 60 * 1000,  // after a reservation: ignore everything this long (basket hold ~15 min)
     TEST_COOLDOWN_MS: 90 * 1000,  // after the one-off smoke test: short, so a real pair is not missed
     WINDOW_MS: 15 * 60 * 1000,    // keep chasing the same seats at most this long
@@ -456,6 +468,25 @@
     });
     return d.slice(0, max).join('; ') + (d.length > max ? ' +' + (d.length - max) + ' more' : '');
   };
+  // Delay before the next listing poll: slow (3 s) while recovering from the bot wall, else 1.2-1.8 s.
+  AB.nextPollDelay = function (now, slowUntil, rnd) {
+    if (slowUntil && now < slowUntil) return AB.SLOW_POLL_MS;
+    return Math.round(AB.POLL_MS + (rnd * 2 - 1) * AB.POLL_JITTER_MS);
+  };
+  // A listing poll error that looks like NFF's bot wall (DataDome) rather than a network blip.
+  AB.isBotWall = function (err) { return /^HTTP (403|429)$|^captcha$|^non-JSON$/.test(String(err)); };
+  // Page text that means "these seats are held in another buyer's basket" (12 Nov wording).
+  AB.isHeldText = function (text) {
+    return /someone else'?s basket|a little too late|not available in (the )?resale channel|annen kundes handlekurv|annens handlekurv|litt for sent/i.test(String(text || ''));
+  };
+  // The first raw listing entry, compact, for the "seen" push (to learn which field, if any,
+  // marks a held seat).
+  AB.rawSample = function (raw, maxChars) {
+    var list = (raw && (raw.resaleItems || raw.items)) || [];
+    if (!list.length) return '';
+    var s; try { s = JSON.stringify(list[0]); } catch (e) { return ''; }
+    return s.length > (maxChars || 700) ? s.slice(0, maxChars || 700) + '...' : s;
+  };
   // EVERY listed seat, sorted and grouped per block and row, so a "seen" push can be checked by
   // eye: "103 r12 s77,90 990; 409 r26 s344 690; ? unnumbered x2". Capped by length (ntfy turns a
   // message over 4096 bytes into an attachment).
@@ -722,8 +753,9 @@
           // NFF made this endpoint login-only on 17 Sep 2026; the logged-in tab still gets
           // JSON, but if the session drops we get the login page instead of silent nonsense.
           if (/\/account\/(login|identification)/i.test(r.url) || /action="\/account\/login"|<title>Identification/i.test(t)) throw 'login';
-          if (!r.ok) throw 'HTTP ' + r.status;
-          try { return JSON.parse(t); } catch (e) { throw /Waiting Room/i.test(t) ? 'waiting room' : 'non-JSON'; }
+          var wall = /captcha-delivery\.com|datadome/i.test(t);
+          if (!r.ok) throw wall ? 'captcha' : 'HTTP ' + r.status;
+          try { return JSON.parse(t); } catch (e) { throw wall ? 'captcha' : /Waiting Room/i.test(t) ? 'waiting room' : 'non-JSON'; }
         });
       });
   }
@@ -755,20 +787,23 @@
 
   // ---- list page: poll + grab ----------------------------------------------------
   function pollOnce() {
-    if (!state.leader || state.busy) { return; }
+    if (!state.leader || state.busy || state.polling) { return; }
     if (pageMode() !== 'list') return;
     if (untilMs('reservedAt')) { state.pollLast = hhmm() + ' cooldown'; render(); return; }
+    if (untilMs('pauseUntil')) { state.pollLast = hhmm() + ' PAUSED (bot wall) ' + Math.ceil(untilMs('pauseUntil') / 1000) + ' s'; render(); return; }
     var ids = Object.keys(matches()), found = null, chain = Promise.resolve();
     if (!ids.length) { state.pollLast = hhmm() + ' NO MATCH SET (press Match)'; render(); return; }
+    state.polling = true;   // never two polls in flight (the ntfy nudge can call in between)
     ids.forEach(function (id) {
       chain = chain.then(function () {
         if (found) return;
         return fetchItems(id).then(function (raw) {
-          state.pollLast = hhmm() + ' ok'; state.loginWarned = false;
+          state.pollLast = hhmm() + ' ok' + (untilMs('slowUntil') ? ' (slow 3 s)' : ''); state.loginWarned = false;
           var t = targetFor(id, raw, state.testOnce); if (t && !found) found = t;
           if (!t) noteSeen(id, raw);
         }, function (err) {
           state.pollLast = hhmm() + ' ' + err;
+          if (AB.isBotWall(err)) { botWall(err); return; }
           if (err === 'login' && !state.loginWarned) {   // session dropped: tell the phone once
             state.loginWarned = true;
             setAction('SESSION EXPIRED - log in again on resale.fotball.no');
@@ -778,7 +813,24 @@
         });
       });
     });
-    return chain.then(function () { render(); if (found) act(found); });
+    function done() { state.polling = false; }
+    return chain.then(function () { done(); render(); if (found) act(found); }, done);
+  }
+  // NFF's bot wall answered instead of the listing: back right off before it blocks the session.
+  function botWall(err) {
+    var now = Date.now(), already = untilMs('slowUntil') > 0;
+    store.set('pauseUntil', String(now + AB.BLOCK_PAUSE_MS));
+    store.set('slowUntil', String(now + AB.BLOCK_PAUSE_MS + AB.SLOW_FOR_MS));
+    setAction('bot wall (' + err + '): paused ' + AB.BLOCK_PAUSE_MS / 1000 + ' s, then polling every ' + AB.SLOW_POLL_MS / 1000 + ' s for ' + AB.SLOW_FOR_MS / 60000 + ' min');
+    if (already) return;   // one push per episode
+    alarm();
+    push('urgent', AB.OWN_TITLE_PREFIX + ': BOT WALL', 'NFF answered the listing poll with ' + err + ' (bot protection). Paused ' + AB.BLOCK_PAUSE_MS / 1000 +
+      ' s, then polling every ' + AB.SLOW_POLL_MS / 1000 + ' s for ' + AB.SLOW_FOR_MS / 60000 + ' min. If the tab shows a captcha or "blocked", solve it / reload.', AB.LIST_PATH);
+  }
+  function pollLoop() {   // a chain of timeouts (not setInterval): the next poll starts only after this one ended
+    function next() { win.setTimeout(pollLoop, AB.nextPollDelay(Date.now(), Number(store.get('slowUntil', '0')), Math.random())); }
+    var p; try { p = pollOnce(); } catch (e) { log('poll failed: ' + e); }
+    Promise.resolve(p).then(next, next);
   }
   // The grab record caps attempts on one seat-set. Two lessons from 21 Sep: (1) the same
   // seats bounce back every ~15 min when a hold expires, and a window anchored to the
@@ -791,16 +843,18 @@
   // no valid group exists (a valid group is handled by act(), which pushes outcomes).
   function noteSeen(id, raw) {
     var seats = AB.expandSeats(AB.normalizeItems(raw));
-    if (!seats.length) { state.seenKey = ''; return; }
+    if (!seats.length) { store.del('seenKey'); return; }
+    // Remembered in the browser, not the page: every reload/navigation used to re-push the same
+    // listing (12 Nov: four pushes for one single).
     var key = seats.map(function (s) { return String(s.movementId); }).sort().join(',');
-    if (state.seenKey === key) return;
-    state.seenKey = key;
+    if (store.get('seenKey', '') === key) return;
+    store.set('seenKey', key);
     var name = matches()[id];
     var most = AB.mostTogether(seats);
     var txt = name + ': ' + seats.length + ' ticket(s) listed, no group of 4-8 together, not reserved. Most together in one row: ' +
-      most.n + ' (' + most.desc + '). All: ' + AB.describeAll(seats) + '. Buy by hand if you want them.';
+      most.n + ' (' + most.desc + '). All: ' + AB.describeAll(seats, 2500) + '. Buy by hand if you want them.';
     setAction(txt); alarm();
-    push('high', AB.OWN_TITLE_PREFIX + ': seen ' + name, txt, AB.matchPage(id));
+    push('high', AB.OWN_TITLE_PREFIX + ': seen ' + name, txt + ' | raw: ' + AB.rawSample(raw), AB.matchPage(id));
   }
   function canTry(target) {
     var now = Date.now(), grab = getJSON('grab');
@@ -874,7 +928,8 @@
           resolve(still === mids.length ? 'our seat(s) STILL LISTED -> NFF refused us' : still === 0 ? 'our seat(s) GONE from the list -> someone was faster' : still + '/' + mids.length + ' of our seats still listed');
         }, function (err) { resolve('listing check failed: ' + err); });
       });
-      return check.then(function (verdict) { failGrab(intent, 'landed on the shop error page before selecting: ' + verdict + '; ' + info); });
+      var held = AB.isHeldText(bodyText || (doc.body && doc.body.textContent));
+      return check.then(function (verdict) { failGrab(intent, 'landed on the shop error page before selecting: ' + verdict + '; ' + info, held && !/GONE/.test(verdict)); });
     }
     var pid = String(intent.pid);
     if (win.location.search.indexOf('performanceId=' + pid) < 0) { tr('item page for another match, ignoring'); return; }
@@ -1123,9 +1178,10 @@
     if (mode === 'queue') { setAction('in the waiting room, holding for ' + intent.name); return true; }
     // Not the cart: report exactly where we landed so the next miss is diagnosable
     var where = win.location.pathname + win.location.search;
-    var errText = (doc.body && doc.body.innerText || '').replace(/\s+/g, ' ').slice(0, 160);
+    var full = (doc.body && (doc.body.innerText || doc.body.textContent) || '').split('NFF auto-basket ')[0];
+    var errText = full.replace(/\s+/g, ' ').slice(0, 160);
     var reason = 'submit landed on ' + where + ' ["' + doc.title + '"]: ' + errText;
-    if (intent.got && intent.got.length) partialFail(intent, reason); else failGrab(intent, reason);
+    if (intent.got && intent.got.length) partialFail(intent, reason); else failGrab(intent, reason, AB.isHeldText(full));
     return true;
   }
   // One seat just landed in the cart. More in the queue -> straight back to the match page
@@ -1169,15 +1225,38 @@
     }
     win.setTimeout(function () { win.location.href = redirect || AB.BASKET_PATH; }, 1500);   // let the RESERVED push leave first
   }
-  function failGrab(intent, reason) {
-    var grab = getJSON('grab'); if (grab) { grab.tries = (grab.tries || 0) + 1; grab.nextTryAt = Date.now() + AB.BACKOFF_MS; setJSON('grab', grab); }
+  // held: NFF said the seats sit in another buyer's basket. That is not our failure: keep the
+  // window open and re-check every HELD_RETRY_MS without spending tries, until the hold runs
+  // out (seats free again, or gone because they paid) or HELD_MAX_MS has passed. Push once.
+  function failGrab(intent, reason, held) {
+    var now = Date.now(), grab = getJSON('grab'), firstHeld = false, heldTooLong = false;
+    if (grab) {
+      if (held) {
+        firstHeld = !grab.heldSince;
+        grab.heldSince = grab.heldSince || now;
+        heldTooLong = now - grab.heldSince > AB.HELD_MAX_MS;
+        if (heldTooLong) grab.tries = AB.MAX_TRIES;   // canTry gives up loudly on the next poll
+        else { grab.since = now; grab.nextTryAt = now + AB.HELD_RETRY_MS; grab.heldChecks = (grab.heldChecks || 0) + 1; }
+      } else { grab.tries = (grab.tries || 0) + 1; grab.nextTryAt = now + AB.BACKOFF_MS; }
+      setJSON('grab', grab);
+    }
     store.del('intent'); state.busy = false;
     var test = !!(intent && intent.test);
     if (test) { store.del('testOnce'); state.testOnce = false; }   // one shot, even on a miss: we have the diagnostic now
     reason = reason + traceText(); store.del('trace');   // every miss carries the step trace
-    setAction((test ? 'TEST miss: ' : 'miss: ') + reason + ' -> back to watching');
-    push(test ? 'urgent' : 'default', AB.OWN_TITLE_PREFIX + (test ? ' TEST FAILED' : ' miss'),
-      (intent && intent.name || '') + ': ' + reason + (test ? ' (test mode off; send this to Claude)' : '. Still watching.'), intent && AB.matchPage(intent.pid));
+    var name = intent && intent.name || '';
+    if (held && !test && !heldTooLong) {
+      setAction('HELD by another buyer: ' + (intent && intent.desc) + ' - re-checking every ' + AB.HELD_RETRY_MS / 1000 + ' s until the hold runs out');
+      if (firstHeld) {
+        alarm();
+        push('high', AB.OWN_TITLE_PREFIX + ': HELD by someone else', name + ': ' + (intent && intent.desc) + ' sits in another buyer\'s basket. Waiting for their hold to run out (~15 min), re-checking every ' +
+          AB.HELD_RETRY_MS / 1000 + ' s. You get RESERVED if it frees up. Detail: ' + reason, intent && AB.matchPage(intent.pid));
+      }
+    } else {
+      setAction((test ? 'TEST miss: ' : 'miss: ') + reason + ' -> back to watching');
+      push(test ? 'urgent' : 'default', AB.OWN_TITLE_PREFIX + (test ? ' TEST FAILED' : ' miss'),
+        name + ': ' + (held ? '[held by another buyer] ' : '') + reason + (test ? ' (test mode off; send this to Claude)' : '. Still watching.'), intent && AB.matchPage(intent.pid));
+    }
     win.setTimeout(function () { if (pageMode() !== 'list') win.location.href = AB.LIST_PATH; }, 1500);   // let the push leave before navigating
   }
 
@@ -1200,9 +1279,8 @@
     if (state.mode === 'item') { fulfillItemPage(); render(); return; }
     if (state.mode === 'queue') { setAction('in the waiting room, holding'); render(); return; }
     if (state.mode === 'list') {
-      win.setInterval(pollOnce, AB.POLL_MS);
       win.setInterval(keepalive, AB.KEEPALIVE_MS);
-      pollOnce();
+      pollLoop();
     }
     render();
   }

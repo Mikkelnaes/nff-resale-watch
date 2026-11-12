@@ -434,6 +434,32 @@ t('mostTogether reports the biggest run in one row', () => {
   assert.deepStrictEqual(m, { n: 2, desc: 'B7 r12 s89-90' });
   assert.deepStrictEqual(AB.mostTogether([]), { n: 0, desc: '-' });
 });
+console.log('# polling pace, bot wall, held seats');
+t('polls every 1.2-1.8 s normally', () => {
+  assert.strictEqual(AB.nextPollDelay(1000, 0, 0), 1200);
+  assert.strictEqual(AB.nextPollDelay(1000, 0, 0.5), 1500);
+  assert.strictEqual(AB.nextPollDelay(1000, 0, 0.999999), 1800);
+  for (let i = 0; i < 200; i++) { const d = AB.nextPollDelay(1000, 0, Math.random()); assert.ok(d >= 1200 && d <= 1800, d); }
+});
+t('polls at the safe 3 s while recovering from the bot wall, fast again after', () => {
+  assert.strictEqual(AB.nextPollDelay(1000, 5000, 0.5), 3000);
+  assert.strictEqual(AB.nextPollDelay(6000, 5000, 0.5), 1500);
+});
+t('bot-wall answers are recognised, ordinary blips are not', () => {
+  ['HTTP 403', 'HTTP 429', 'captcha', 'non-JSON'].forEach((e) => assert.strictEqual(AB.isBotWall(e), true, e));
+  ['HTTP 500', 'login', 'waiting room', 'TypeError: Failed to fetch'].forEach((e) => assert.strictEqual(AB.isBotWall(e), false, e));
+});
+t('the two 12 Nov "held by someone else" pages are recognised', () => {
+  assert.ok(AB.isHeldText("Error Unfortunately, you're a little too late. The ticket(s) are currently in someone else's basket. If they"));
+  assert.ok(AB.isHeldText('Product not available Sorry, your selected product is not available in resale channel. Please continue shopping'));
+  assert.ok(!AB.isHeldText('Sorry, we are unable to process your request at the moment.'));
+  assert.ok(!AB.isHeldText(''));
+});
+t('raw sample shows the first listing entry, capped', () => {
+  assert.strictEqual(AB.rawSample({ resaleItems: [{ a: 1 }, { b: 2 }] }), '{"a":1}');
+  assert.strictEqual(AB.rawSample({ resaleItems: [] }), '');
+  assert.ok(AB.rawSample({ resaleItems: [{ x: 'y'.repeat(2000) }] }).length <= 703);
+});
 t('seat description caps the list', () => {
   const d = AB.describeSeats(S(1, 3, 5, 7, 9, 11, 13, 15));
   assert.ok(d.endsWith('+2 more'), d);
