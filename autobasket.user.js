@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.5.2
+// @version      0.5.3
 // @description  Watches NFF resale from your own logged-in browser, and when 4-8 seats together appear for the chosen match it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -35,7 +35,8 @@
   neighbouring seats in a row (best), or runs of at least 2 seats in 2-3 consecutive rows of
   the same block, one behind the other. More seats beat fewer; at the same count one row beats
   several. A multi-row group is measured on
-  the seat map before submitting and skipped if the rows are not actually behind each other.
+  the seat map only when the page has no form (v0.5.3 submits the form at once), else it is
+  reserved unchecked and the RESERVED push says to look before paying.
   The match is set with the overlay's "Match" button (paste the match URL or performanceId).
 
   The pure decision logic is exported for `node test_autobasket.js`.
@@ -44,7 +45,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.5.2',
+    VERSION: '0.5.3',
     // performanceId -> name (14 Nov 2026, Ullevaal; link from the resale list, 12 Nov). The overlay's
     // "Match" button can add another one (stored in this browser).
     MATCHES: { '10229739913108': 'NL 14 Nov' },
@@ -941,22 +942,26 @@
     if (!queue.length) { store.del('intent'); return; }
     intent.queue = queue; intent.current = queue[0];
     var payload = queue[0], nSeats = (payload.resaleItemData || []).length;
-    setAction('through the queue on ' + intent.name + ', selecting ' + nSeats + ' seat(s) on the seat map');
-    // 1) SEAT MAP, exactly like a human: zoom to the block, "click" each of our seats through the
-    //    map's own select control (the page's handler adds it to the selection), then press the
-    //    page's own Add to cart (SeatList.completeAndSubmitResaleForm) which posts ALL seats in
-    //    one submit - the only way a pair is accepted (no-orphan-seat rule).
-    // 2) Single seat only: the list module's selectItem + addToCart.
-    // 3) Our own form with all seats (same row shape the seat map posts).
-    driveSeatMap(intent, payload).then(function (done) {
-      if (done) return;
-      if (nSeats === 1) {
-        return waitFor(function () { return pageUiReady(payload); }, 3000, 150).then(function (ready) {
-          if (ready && driveRealUI(payload, intent)) return;
-          submitRealForm(payload, csrf, intent, intent.desc + ' [own form]');
-        });
-      }
-      submitRealForm(payload, csrf, intent, intent.desc + ' [own form]');
+    // v0.5.3: THE PAGE'S OWN FORM FIRST, at once, with all seats (one row per seat). That is the
+    // path that actually reserved the 25 Sep Portugal four ("[own form]", after the seat map had
+    // failed), and the 17 Sep single. On 12 Nov the seat map spent ~12 s (seats loading, "add did
+    // not register") before falling back to the form; in a race that is the difference.
+    // The seat map (and its multi-row distance check) is now only the fallback when the page has
+    // no form; a multi-row group therefore lands unchecked and the RESERVED push says so.
+    setAction('through the queue on ' + intent.name + ', submitting ' + nSeats + ' seat(s) with the page form at once');
+    waitFor(function () { return !!doc.getElementById(AB.FORM_ID); }, 1500, 100).then(function (hasForm) {
+      tr('page form ' + (hasForm ? 'present -> own form at once' : 'missing -> seat map'));
+      if (hasForm) return submitRealFormNow(payload, csrf, intent, intent.desc + ' [own form]');
+      return driveSeatMap(intent, payload).then(function (done) {
+        if (done) return;
+        if (nSeats === 1) {
+          return waitFor(function () { return pageUiReady(payload); }, 3000, 150).then(function (ready) {
+            if (ready && driveRealUI(payload, intent)) return;
+            submitRealForm(payload, csrf, intent, intent.desc + ' [own form]');
+          });
+        }
+        submitRealForm(payload, csrf, intent, intent.desc + ' [own form]');
+      });
     });
   }
   // ---- seat map driving --------------------------------------------------------------
