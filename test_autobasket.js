@@ -131,17 +131,17 @@ t('nested seats list is expanded with its own numbers', () => {
 });
 t('a line without any id yields no seat', () => assert.strictEqual(seatsFrom([{ price: 450, seatPath: 'B7 / 12 / 5' }]).length, 0));
 
-console.log('# group selection: 4-8 together, never 1-3, 5 only to avoid stranding a seat');
+console.log('# group selection: 2-8 together, never a single, 5 only to avoid stranding a seat');
 const S = (...seatNos) => seatsFrom(seatNos.map((n, i) => siteItem({ mid: 100 + i, seat: n })));
 const R = (row, ...seatNos) => seatNos.map((n) => siteItem({ mid: Number(row) * 1000 + n, row: String(row), seat: n }));
 const G = (...lists) => AB.chooseGroup(seatsFrom([].concat(...lists)));
 const rowsOf = (c) => c.rows.map((r) => r[0].row + ':' + r.map((s) => s.seatNo).join(','));
 const range = (a, b) => Array.from({ length: b - a + 1 }, (_, i) => a + i);
 t('nothing listed', () => assert.strictEqual(AB.chooseGroup([]), null));
-t('one, two or three seats are never taken', () => {
+t('a single seat is never taken; 2 or 3 side by side are (13 Nov)', () => {
   assert.strictEqual(AB.chooseGroup(S(5)), null);
-  assert.strictEqual(AB.chooseGroup(S(5, 6)), null);
-  assert.strictEqual(AB.chooseGroup(S(5, 6, 7)), null);
+  assert.deepStrictEqual(nos(AB.chooseGroup(S(5, 6))), [5, 6]);
+  assert.deepStrictEqual(nos(AB.chooseGroup(S(5, 6, 7))), [5, 6, 7]);
 });
 t('four in a row give 4', () => { const c = AB.chooseGroup(S(5, 6, 7, 8)); assert.strictEqual(c.count, 4); assert.deepStrictEqual(nos(c), [5, 6, 7, 8]); assert.strictEqual(c.rows.length, 1); });
 t('five in a row give 5 (4 would leave one seat alone)', () => { const c = AB.chooseGroup(S(5, 6, 7, 8, 9)); assert.strictEqual(c.count, 5); assert.strictEqual(c.orphans, 0); });
@@ -155,11 +155,11 @@ t('nine in a row give 7, not 8 (8 would leave one seat alone)', () => {
 t('ten or more in a row give 8 (the most we take), the spare seats together', () => {
   for (const n of [10, 11, 12, 15]) { const c = AB.chooseGroup(S(...range(1, n))); assert.strictEqual(c.count, 8, 'run ' + n); assert.strictEqual(c.orphans, 0, 'run ' + n); }
 });
-t('seats with a gap are not neighbours', () => assert.strictEqual(AB.chooseGroup(S(1, 2, 4, 5)), null));
-t('two pairs in different blocks are not a group (all seats must sit together now)', () => {
-  assert.strictEqual(G([siteItem({ mid: 1, seat: 5, area: 'B7' }), siteItem({ mid: 2, seat: 6, area: 'B7' }), siteItem({ mid: 3, seat: 5, area: 'C1' }), siteItem({ mid: 4, seat: 6, area: 'C1' })]), null);
+t('seats with a gap are not neighbours (only a pair is taken)', () => assert.strictEqual(AB.chooseGroup(S(1, 2, 4, 5)).count, 2));
+t('two pairs in different blocks are not a group of 4 (one pair is taken)', () => {
+  assert.strictEqual(G([siteItem({ mid: 1, seat: 5, area: 'B7' }), siteItem({ mid: 2, seat: 6, area: 'B7' }), siteItem({ mid: 3, seat: 5, area: 'C1' }), siteItem({ mid: 4, seat: 6, area: 'C1' })]).count, 2);
 });
-t('two pairs in rows far apart in the same block are not a group', () => assert.strictEqual(G(R(12, 5, 6), R(20, 5, 6)), null));
+t('two pairs in rows far apart in the same block are not a group of 4', () => { const c = G(R(12, 5, 6), R(20, 5, 6)); assert.strictEqual(c.count, 2); assert.strictEqual(c.rows.length, 1); });
 t('2 + 2 directly behind each other give 4', () => {
   const c = G(R(34, 50, 51), R(35, 50, 51));
   assert.strictEqual(c.count, 4); assert.deepStrictEqual(rowsOf(c), ['34:50,51', '35:50,51']);
@@ -169,7 +169,7 @@ t('the example: row 34 seats 50-52 and row 35 seats 50-52 give 6', () => {
   assert.strictEqual(c.count, 6); assert.deepStrictEqual(rowsOf(c), ['34:50,51,52', '35:50,51,52']);
 });
 t('"or nearby": row 35 shifted two seats still counts', () => assert.strictEqual(G(R(34, 50, 51, 52), R(35, 52, 53, 54)).count, 6));
-t('rows behind each other but far apart in seat numbers are not a group', () => assert.strictEqual(G(R(34, 50, 51), R(35, 80, 81)), null));
+t('rows behind each other but far apart in seat numbers are not a group of 4', () => { const c = G(R(34, 50, 51), R(35, 80, 81)); assert.strictEqual(c.count, 2); assert.strictEqual(c.rows.length, 1); });
 t('3 + 2 behind each other give 5 (4 would strand a seat)', () => {
   const c = G(R(34, 50, 51, 52), R(35, 50, 51));
   assert.strictEqual(c.count, 5); assert.strictEqual(c.rows.length, 2); assert.strictEqual(c.orphans, 0);
@@ -178,7 +178,7 @@ t('5 is never taken when it would itself strand a seat', () => {
   assert.strictEqual(AB.fitRuns([S(1, 2, 3, 4, 5, 6)]).count, 6);
   assert.strictEqual(AB.ALLOWED.indexOf(5), -1);
 });
-t('a single seat in the row behind is not used', () => assert.strictEqual(G(R(34, 50, 51, 52), R(35, 51)), null));
+t('a single seat in the row behind is not used', () => assert.deepStrictEqual(rowsOf(G(R(34, 50, 51, 52), R(35, 51))), ['34:50,51,52']));
 t('three rows of 2 give 6', () => assert.strictEqual(G(R(10, 5, 6), R(11, 5, 6), R(12, 5, 6)).count, 6));
 t('three rows of 4 give 8 at most', () => {
   const c = G(R(10, 5, 6, 7, 8), R(11, 5, 6, 7, 8), R(12, 5, 6, 7, 8));
@@ -215,7 +215,7 @@ t('same count: the cheaper group wins', () => {
 t('unnumbered tickets are never taken', () => {
   assert.strictEqual(AB.chooseGroup(seatsFrom([{ movementIds: [1, 2, 3, 4], availableQuantity: 4, seatCategoryId: 1, audienceSubCategoryId: 1, price: 1 }])), null);
 });
-t('duplicate listings of the same seat do not count twice', () => assert.strictEqual(AB.chooseGroup(S(5, 5, 6, 7)), null));
+t('duplicate listings of the same seat do not count twice', () => assert.strictEqual(AB.chooseGroup(S(5, 5, 6, 7)).count, 3));
 t('a group the seat map showed apart (skip list) is passed over for the next best', () => {
   const seats = seatsFrom([...R(34, 50, 51, 52), ...R(35, 50, 51, 52), ...R(3, 1, 2, 3, 4)]);
   const first = AB.chooseGroup(seats);
@@ -226,7 +226,7 @@ t('a group the seat map showed apart (skip list) is passed over for the next bes
 t('ignored movement ids (known unbuyable listing) are never chosen', () => {
   const old = AB.IGNORE_MOVEMENTS; AB.IGNORE_MOVEMENTS = ['100', '101'];
   try {
-    assert.strictEqual(AB.chooseGroup(S(5, 6, 7, 8)), null, 'only 7-8 left');
+    assert.deepStrictEqual(nos(AB.chooseGroup(S(5, 6, 7, 8))), [7, 8], 'only 7-8 left');
     const c = AB.chooseGroup(S(5, 6, 7, 8, 9, 10));
     assert.deepStrictEqual(nos(c), [7, 8, 9, 10]);
   } finally { AB.IGNORE_MOVEMENTS = old; }
@@ -234,7 +234,7 @@ t('ignored movement ids (known unbuyable listing) are never chosen', () => {
 t('ignored seat positions (known unbuyable seats) are never chosen', () => {
   const old = AB.IGNORE_SEATS; AB.IGNORE_SEATS = ['B7 r12 s5', 'B7 r12 s6'];
   try {
-    assert.strictEqual(AB.chooseGroup(S(5, 6, 7, 8)), null);
+    assert.deepStrictEqual(nos(AB.chooseGroup(S(5, 6, 7, 8))), [7, 8]);
     assert.deepStrictEqual(nos(AB.chooseGroup(S(5, 6, 7, 8, 9, 10))), [7, 8, 9, 10]);
   } finally { AB.IGNORE_SEATS = old; }
 });

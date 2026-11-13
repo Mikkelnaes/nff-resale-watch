@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.5.3
-// @description  Watches NFF resale from your own logged-in browser, and when 4-8 seats together appear for the chosen match it rides the real waiting room and reserves them in your basket.
+// @version      0.5.4
+// @description  Watches NFF resale from your own logged-in browser, and when 2-8 seats together appear for the chosen match it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
 // @run-at       document-idle
@@ -35,7 +35,7 @@
   neighbouring seats in a row (best), or runs of at least 2 seats in 2-3 consecutive rows of
   the same block, one behind the other. More seats beat fewer; at the same count one row beats
   several. A multi-row group is measured on
-  the seat map only when the page has no form (v0.5.3 submits the form at once), else it is
+  the seat map only when the page has no form (v0.5.4 submits the form at once), else it is
   reserved unchecked and the RESERVED push says to look before paying.
   The match is set with the overlay's "Match" button (paste the match URL or performanceId).
 
@@ -45,12 +45,12 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.5.3',
+    VERSION: '0.5.4',
     // performanceId -> name (14 Nov 2026, Ullevaal; link from the resale list, 12 Nov). The overlay's
     // "Match" button can add another one (stored in this browser).
     MATCHES: { '10229739913108': 'NL 14 Nov' },
     DEFAULT_MATCH_NAME: 'NL 14 Nov',
-    ALLOWED: [8, 7, 6, 4],        // ticket counts we take, best first: never 1-3, at most 8
+    ALLOWED: [8, 7, 6, 4, 3, 2],  // ticket counts we take, best first: never a single, at most 8 (2-3 added 13 Nov)
     ONLY_IF_NO_LONE_SEAT: [5],    // 5 only when 4 would leave one seat alone (NFF may refuse a stranded seat)
     MIN_PER_ROW: 2,               // a multi-row group needs at least this many neighbours in each row
     MAX_ROWS: 3,                  // ...and spans at most this many consecutive rows
@@ -636,7 +636,7 @@
     el.textContent =
       'NFF auto-basket ' + AB.VERSION + (state.armed ? '  ARMED' : '  DRY RUN (no reservation)') + '\n' +
       'match: ' + (mk.length ? mk.map(function (k) { return ms[k] + ' (' + k + ')'; }).join(', ') : 'NOT SET - press Match') + '\n' +
-      'takes: 4-8 together (5 only to avoid a lone seat) (one row, or rows behind each other)\n' +
+      'takes: 2-8 together (5 only to avoid a lone seat) (one row, or rows behind each other)\n' +
       'page: ' + state.mode + '   topic: ' + (state.topic ? state.topic.slice(0, 6) + '...' : 'NOT SET') + '   ntfy: ' + state.sseState + '\n' +
       'this tab: ' + (state.leader ? 'active' : 'standby') + '   login: ' + loggedIn() + '   audio: ' + (state.audio ? 'armed' : 'NOT ARMED') + '\n' +
       'poll: ' + state.pollLast + '   last alert: ' + state.lastEvent + '\n' +
@@ -852,7 +852,7 @@
     store.set('seenKey', key);
     var name = matches()[id];
     var most = AB.mostTogether(seats);
-    var txt = name + ': ' + seats.length + ' ticket(s) listed, no group of 4-8 together, not reserved. Most together in one row: ' +
+    var txt = name + ': ' + seats.length + ' ticket(s) listed, no group of 2-8 together, not reserved. Most together in one row: ' +
       most.n + ' (' + most.desc + '). All: ' + AB.describeAll(seats, 2500) + '. Buy by hand if you want them.';
     setAction(txt); alarm();
     push('high', AB.OWN_TITLE_PREFIX + ': seen ' + name, txt + ' | raw: ' + AB.rawSample(raw), AB.matchPage(id));
@@ -942,7 +942,7 @@
     if (!queue.length) { store.del('intent'); return; }
     intent.queue = queue; intent.current = queue[0];
     var payload = queue[0], nSeats = (payload.resaleItemData || []).length;
-    // v0.5.3: THE PAGE'S OWN FORM FIRST, at once, with all seats (one row per seat). That is the
+    // v0.5.4: THE PAGE'S OWN FORM FIRST, at once, with all seats (one row per seat). That is the
     // path that actually reserved the 25 Sep Portugal four ("[own form]", after the seat map had
     // failed), and the 17 Sep single. On 12 Nov the seat map spent ~12 s (seats loading, "add did
     // not register") before falling back to the form; in a race that is the difference.
@@ -1221,7 +1221,7 @@
       store.set('reservedAt', String(Date.now() + AB.TEST_COOLDOWN_MS));
       setAction('TEST OK: ' + desc + ' landed in the cart. EMPTY THE CART now to release it.');
       alarm();
-      push('urgent', AB.OWN_TITLE_PREFIX + ' TEST OK', 'The submit path WORKS: ' + desc + ' landed in the cart. Empty the cart now so the ticket is released. Test mode is off; normal rules (4-8 together) resume.', AB.BASKET_PATH);
+      push('urgent', AB.OWN_TITLE_PREFIX + ' TEST OK', 'The submit path WORKS: ' + desc + ' landed in the cart. Empty the cart now so the ticket is released. Test mode is off; normal rules (2-8 together) resume.', AB.BASKET_PATH);
     } else {
       store.set('reservedAt', String(Date.now() + AB.COOLDOWN_MS));
       setAction('RESERVED ' + desc);
