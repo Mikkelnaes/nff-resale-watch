@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NFF resale auto-basket
 // @namespace    https://github.com/Mikkelnaes/nff-resale-watch
-// @version      0.5.4
+// @version      0.5.5
 // @description  Watches NFF resale from your own logged-in browser, and when 2-8 seats together appear for the chosen match it rides the real waiting room and reserves them in your basket.
 // @match        https://resale.fotball.no/*
 // @grant        none
@@ -35,7 +35,7 @@
   neighbouring seats in a row (best), or runs of at least 2 seats in 2-3 consecutive rows of
   the same block, one behind the other. More seats beat fewer; at the same count one row beats
   several. A multi-row group is measured on
-  the seat map only when the page has no form (v0.5.4 submits the form at once), else it is
+  the seat map only when the page has no form (v0.5.5 submits the form at once), else it is
   reserved unchecked and the RESERVED push says to look before paying.
   The match is set with the overlay's "Match" button (paste the match URL or performanceId).
 
@@ -45,7 +45,7 @@
   'use strict';
 
   var AB = {
-    VERSION: '0.5.4',
+    VERSION: '0.5.5',
     // performanceId -> name (14 Nov 2026, Ullevaal; link from the resale list, 12 Nov). The overlay's
     // "Match" button can add another one (stored in this browser).
     MATCHES: { '10229739913108': 'NL 14 Nov' },
@@ -77,6 +77,12 @@
     // HELD_MAX_MS has passed.
     HELD_RETRY_MS: 20 * 1000,
     HELD_MAX_MS: 20 * 60 * 1000,
+    // v0.5.5 fast lane: send the order straight from the list page (a real form POST, like a
+    // button press) instead of loading the match page first; 13 Nov 17:37 that load cost 2 s of
+    // a race we lost. If NFF refuses it, the same grab goes the normal way at once; after
+    // FAST_LANE_MAX_FAILS refusals it stays off (Reset turns it back on).
+    FAST_LANE: true,
+    FAST_LANE_MAX_FAILS: 2,
     COOLDOWN_MS: 20 * 60 * 1000,  // after a reservation: ignore everything this long (basket hold ~15 min)
     TEST_COOLDOWN_MS: 90 * 1000,  // after the one-off smoke test: short, so a real pair is not missed
     WINDOW_MS: 15 * 60 * 1000,    // keep chasing the same seats at most this long
@@ -637,6 +643,7 @@
       'NFF auto-basket ' + AB.VERSION + (state.armed ? '  ARMED' : '  DRY RUN (no reservation)') + '\n' +
       'match: ' + (mk.length ? mk.map(function (k) { return ms[k] + ' (' + k + ')'; }).join(', ') : 'NOT SET - press Match') + '\n' +
       'takes: 2-8 together (5 only to avoid a lone seat) (one row, or rows behind each other)\n' +
+      'fast lane: ' + fastLaneState() + '\n' +
       'page: ' + state.mode + '   topic: ' + (state.topic ? state.topic.slice(0, 6) + '...' : 'NOT SET') + '   ntfy: ' + state.sseState + '\n' +
       'this tab: ' + (state.leader ? 'active' : 'standby') + '   login: ' + loggedIn() + '   audio: ' + (state.audio ? 'armed' : 'NOT ARMED') + '\n' +
       'poll: ' + state.pollLast + '   last alert: ' + state.lastEvent + '\n' +
@@ -674,7 +681,7 @@
       setAction(state.testOnce ? 'TEST MODE armed: the next single ticket will be reserved once (empty the cart afterwards)' : 'test mode off');
     };
     doc.getElementById('ab-reset').onclick = function () {
-      ['reservedAt', 'grab', 'intent', 'testOnce', 'farKeys'].forEach(store.del); state.busy = false; state.lastDry = ''; state.testOnce = false; setAction('reset');
+      ['reservedAt', 'grab', 'intent', 'testOnce', 'farKeys', 'fastFails', 'csrf'].forEach(store.del); state.busy = false; state.lastDry = ''; state.testOnce = false; setAction('reset');
     };
   }
 
@@ -897,8 +904,45 @@
                         seats: seatSpecs, rows: nRows, unchecked: nRows > 1,   // cleared once the seat map shows the rows together
                         test: !!target.test, createdAt: Date.now(), status: 'go' });
     store.del('trace'); tr('grab ' + target.desc + ' (' + seatSpecs.map(AB.seatPos).join(', ') + ') block ' + seatSpecs[0].blockId + ' mids ' + seatSpecs.map(function (s) { return s.mid; }).join('/'));
+    var fastCsrf = fastLaneCsrf();
+    if (fastCsrf) { fastSubmit(target.payload, fastCsrf, getJSON('intent')); return; }
+    tr('fast lane ' + fastLaneState() + ' -> match page');
     setAction((target.test ? 'TEST: ' : '') + 'grabbing ' + target.desc + ' -> entering the queue');
     win.setTimeout(function () { win.location.href = AB.matchPage(target.id); }, 50);
+  }
+  // ---- fast lane (v0.5.5) ---------------------------------------------------------------
+  function fastFails() { return Number(store.get('fastFails') || 0); }
+  function fastLaneState() {
+    if (!AB.FAST_LANE) return 'off (config)';
+    if (fastFails() >= AB.FAST_LANE_MAX_FAILS) return 'OFF after ' + fastFails() + ' refusals (Reset turns it on)';
+    var src = csrfFrom(doc.documentElement.innerHTML) ? 'token on this page' : store.get('csrf') ? 'saved token' : 'no token yet';
+    return 'on (' + src + (fastFails() ? ', ' + fastFails() + ' refusal' : '') + ')';
+  }
+  function fastLaneCsrf() {   // -> the _csrf to use, or null when the fast lane cannot or may not run
+    if (!AB.FAST_LANE || fastFails() >= AB.FAST_LANE_MAX_FAILS || pageMode() !== 'list') return null;
+    return csrfFrom(doc.documentElement.innerHTML) || store.get('csrf') || null;
+  }
+  function fastSubmit(payload, csrf, intent) {
+    intent.fast = true; intent.status = 'submitting'; intent.desc = intent.desc + ' [fast lane]'; setJSON('intent', intent);
+    if (intent.test) { store.del('testOnce'); state.testOnce = false; }
+    var form = doc.createElement('form');
+    form.method = 'POST'; form.action = AB.FORM_SUBMIT_PATH; form.id = 'ab-fast-form'; form.style.display = 'none';
+    fillForm(form, payload, csrf);
+    doc.body.appendChild(form);
+    tr('fast lane: submit from the list page (' + (payload.resaleItemData || []).length + ' rows, ' + (csrfFrom(doc.documentElement.innerHTML) ? 'page' : 'saved') + ' token)');
+    setAction((intent.test ? 'TEST: ' : '') + 'FAST LANE: submitting ' + intent.desc);
+    form.submit();   // real navigation: lands on the cart, or an error page (checkPostSubmit)
+  }
+  // NFF did not take the fast-lane submit and did not say the seats are held: count it, drop the
+  // saved token, and send the same grab the normal way (match page) at once.
+  function fastLaneRefused(intent, reason) {
+    var n = fastFails() + 1; store.set('fastFails', String(n)); store.del('csrf');
+    tr('fast lane refused #' + n + ': ' + reason.slice(0, 200));
+    push('default', AB.OWN_TITLE_PREFIX + ': fast lane refused', intent.desc + ': ' + reason.slice(0, 300) +
+      (n >= AB.FAST_LANE_MAX_FAILS ? ' -> fast lane now OFF, normal path from here.' : ' -> going the normal way now.') + ' (send this to Claude)', AB.matchPage(intent.pid));
+    intent.fast = false; intent.status = 'go'; intent.desc = String(intent.desc).replace(' [fast lane]', ''); setJSON('intent', intent);
+    setAction('fast lane refused, going the normal way for ' + intent.desc);
+    win.setTimeout(function () { win.location.href = AB.matchPage(intent.pid); }, 150);
   }
 
   // ---- item page: complete the reservation on the real page ----------------------
@@ -935,6 +979,7 @@
     var pid = String(intent.pid);
     if (win.location.search.indexOf('performanceId=' + pid) < 0) { tr('item page for another match, ignoring'); return; }
     var csrf = csrfFrom(doc.documentElement.innerHTML);
+    if (csrf) store.set('csrf', csrf);   // the fast lane can use it from the list page
     // One seat per submit (see AB.singlePayloads). Take the next single-seat payload from
     // the queue and submit it at once; the cart landing (checkPostSubmit) comes back for the rest.
     var queue = intent.queue || (intent.payload ? [intent.payload] : []);
@@ -942,7 +987,7 @@
     if (!queue.length) { store.del('intent'); return; }
     intent.queue = queue; intent.current = queue[0];
     var payload = queue[0], nSeats = (payload.resaleItemData || []).length;
-    // v0.5.4: THE PAGE'S OWN FORM FIRST, at once, with all seats (one row per seat). That is the
+    // v0.5.5: THE PAGE'S OWN FORM FIRST, at once, with all seats (one row per seat). That is the
     // path that actually reserved the 25 Sep Portugal four ("[own form]", after the seat map had
     // failed), and the 17 Sep single. On 12 Nov the seat map spent ~12 s (seats loading, "add did
     // not register") before falling back to the form; in a race that is the difference.
@@ -1143,6 +1188,11 @@
     var form = doc.getElementById(AB.FORM_ID);
     if (!form) { return submitBg(payload, csrf, intent, desc); }
     tr('own form submit (' + (payload.resaleItemData || []).length + ' rows)');
+    fillForm(form, payload, csrf);
+    setAction('submitting ' + desc);
+    form.submit();   // real navigation: lands on the cart, or an error page
+  }
+  function fillForm(form, payload, csrf) {   // our fields into a form: performanceId, one resaleItemData row per seat, _csrf
     Array.prototype.slice.call(form.querySelectorAll('input[name^="resaleItemData"], input[name="performanceId"]'))
       .forEach(function (n) { n.parentNode.removeChild(n); });
     function add(name, val) { var i = doc.createElement('input'); i.type = 'hidden'; i.name = name; i.value = (val === undefined || val === null ? '' : val); form.appendChild(i); }
@@ -1158,8 +1208,6 @@
       (d.movementIds || []).forEach(function (mid, j) { add(p + 'movementIds[' + j + ']', mid); });
     });
     if (csrf && !form.querySelector('input[name="_csrf"]')) add('_csrf', csrf);
-    setAction('submitting ' + desc);
-    form.submit();   // real navigation: lands on the cart, or an error page
   }
   function submitBg(payload, csrf, intent, desc) {   // fallback if the page has no form
     win.fetch(AB.FORM_SUBMIT_PATH, { method: 'POST', credentials: 'same-origin', redirect: 'follow',
@@ -1179,13 +1227,14 @@
     var intent = getJSON('intent');
     if (!intent || intent.status !== 'submitting') return false;
     var mode = pageMode();
-    if (mode === 'cart') { advance(intent); return true; }
+    if (mode === 'cart') { if (intent.fast) { store.del('fastFails'); tr('fast lane landed in the cart'); } advance(intent); return true; }
     if (mode === 'queue') { setAction('in the waiting room, holding for ' + intent.name); return true; }
     // Not the cart: report exactly where we landed so the next miss is diagnosable
     var where = win.location.pathname + win.location.search;
     var full = (doc.body && (doc.body.innerText || doc.body.textContent) || '').split('NFF auto-basket ')[0];
     var errText = full.replace(/\s+/g, ' ').slice(0, 160);
     var reason = 'submit landed on ' + where + ' ["' + doc.title + '"]: ' + errText;
+    if (intent.fast && !AB.isHeldText(full)) { fastLaneRefused(intent, reason); return true; }
     if (intent.got && intent.got.length) partialFail(intent, reason); else failGrab(intent, reason, AB.isHeldText(full));
     return true;
   }
